@@ -428,7 +428,11 @@ def read_extrude(design, f, sketches):
         d["start_offset"] = st.offset.expression
     elif isinstance(st, adsk.fusion.FromEntityStartDefinition):
         d["start"] = type(st).__name__
-        d["from"] = entity_point(design, st.entity)
+        try:
+            d["from"] = entity_point(design, st.entity)
+        except Exception:
+            # Fusion can't give the entity back for some starts (a face of a base feature).
+            d["from"] = None
         try:
             d["from_offset"] = expr(st.offset)
         except Exception:
@@ -436,7 +440,13 @@ def read_extrude(design, f, sketches):
     elif not isinstance(st, adsk.fusion.ProfilePlaneStartDefinition):
         d["start"] = type(st).__name__
     profs = []
-    for p in items(f.profile):
+    try:
+        chosen = items(f.profile)
+    except Exception:
+        # A lost profile reference: Fusion keeps the feature's cached result.
+        d["broken"] = (getattr(f, "errorOrWarningMessage", "") or "profile reference lost").split("<")[0].strip()
+        chosen = []
+    for p in chosen:
         if isinstance(p, adsk.fusion.Profile):
             profs.append(profile_info(p))
         elif isinstance(p, adsk.fusion.BRepFace):
@@ -928,6 +938,26 @@ def components(design):
     return out
 
 
+def export_bodies(bodies, path):
+    """Bodies to STEP by way of a scratch document, whatever their visibility. The scratch
+    document is closed without saving."""
+    app_ = adsk.core.Application.get()
+    tbm = adsk.fusion.TemporaryBRepManager.get()
+    copies = [(b.name, tbm.copy(b)) for b in bodies]
+    was = app_.activeDocument
+    doc = app_.documents.add(adsk.core.DocumentTypes.FusionDesignDocumentType)
+    try:
+        d = adsk.fusion.Design.cast(doc.products.itemByProductType("DesignProductType"))
+        d.designType = adsk.fusion.DesignTypes.DirectDesignType
+        for name, t in copies:
+            d.rootComponent.bRepBodies.add(t).name = name
+        d.exportManager.execute(d.exportManager.createSTEPExportOptions(path, d.rootComponent))
+    finally:
+        doc.close(False)
+        if was:
+            was.activate()
+
+
 def export_step(design, index, components, folder):
     """The bodies of these components as they are just after timeline step `index`, one STEP
     file per component: [{component, path, matrix}] with the component's world placement
@@ -953,17 +983,28 @@ def export_step(design, index, components, folder):
                         if not o.isLightBulbOn:
                             hidden.append(o)
                         o = o.assemblyContext
+            if comp != design.rootComponent:
+                # A body can also be hidden in one placement of its component only.
+                for o in design.rootComponent.allOccurrencesByComponent(comp):
+                    hidden += [b for b in o.bRepBodies if not b.isLightBulbOn]
             for b in hidden:
                 b.isLightBulbOn = True
             try:
                 em.execute(em.createSTEPExportOptions(path, comp))
+                # Some bodies stay invisible with every light bulb on; STEP export skips them.
+                unseen = [b for b in comp.bRepBodies if not b.isVisible]
             finally:
                 for b in hidden:
                     b.isLightBulbOn = False
             m = list(occ_transform(design, comp).asArray())
             for i in (3, 7, 11):
                 m[i] *= CM
-            out.append({"component": name, "path": path, "matrix": [round(v, 9) for v in m]})
+            m = [round(v, 9) for v in m]
+            out.append({"component": name, "path": path, "matrix": m})
+            if unseen:
+                extra = path[:-5] + "-unseen.step"
+                export_bodies(unseen, extra)
+                out.append({"component": name, "path": extra, "matrix": m})
     finally:
         if marker >= tl.count:
             tl.moveToEnd()

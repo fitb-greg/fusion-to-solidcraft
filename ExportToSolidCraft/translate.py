@@ -354,6 +354,9 @@ class Translator:
         return None
 
     def f_ExtrudeFeature(self, s, f, new, gone, after):
+        if f.get("broken"):
+            self.note("%s: %s in Fusion" % (s["name"], f["broken"]))
+            return self.fallback(s, new, after)
         sketch, profs, points = self.profiles(f)
         faces = [p["face"] for p in f.get("profiles", []) if "face" in p]
         params = {"name": self.fname(s)}

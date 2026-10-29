@@ -16,6 +16,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 CMD_ID = "ExportToSolidCraftCmd"
+PALETTE_ID = "ExportToSolidCraftStatus"
 SETTINGS = os.path.join(os.path.expanduser("~"), ".fusion2solidcraft.json")
 _handlers = []
 
@@ -61,6 +62,98 @@ def find_app(cli):
     return None
 
 
+def open_in_solidcraft(cli, out):
+    appl = find_app(cli)
+    if platform.system() == "Darwin":
+        if appl and appl.endswith(".app"):
+            subprocess.Popen(["open", "-a", appl, out])
+        elif appl:
+            subprocess.Popen([appl, out], start_new_session=True)
+        else:
+            subprocess.Popen(["open", out])
+    else:
+        subprocess.Popen([appl, out] if appl else ["cmd", "/c", "start", "", out])
+
+
+def reveal(path):
+    if platform.system() == "Darwin":
+        subprocess.Popen(["open", path] if os.path.isdir(path) else ["open", "-R", path])
+    elif os.path.isdir(path):
+        subprocess.Popen(["explorer", path])
+    else:
+        subprocess.Popen(["explorer", "/select,", path])
+
+
+class StatusHandler(adsk.core.HTMLEventHandler):
+    def notify(self, args):
+        a = adsk.core.HTMLEventArgs.cast(args)
+        st = _status[0]
+        try:
+            if st is None:
+                pass
+            elif a.action == "ready":
+                st.ready = True
+            elif a.action == "open" and st.out:
+                open_in_solidcraft(st.cli, st.out)
+            elif a.action == "report" and st.out:
+                reveal_file = os.path.splitext(st.out)[0] + ".report.txt"
+                subprocess.Popen(["open", "-t", reveal_file] if platform.system() == "Darwin" else ["notepad", reveal_file])
+            elif a.action == "folder" and st.out:
+                reveal(st.out)
+            a.returnData = "OK"
+        except Exception:
+            a.returnData = traceback.format_exc()
+
+
+class Status:
+    """The status window: what the export is doing, what came in as Fusion's result, and at the
+    end buttons to open the result. It stays open after the export."""
+
+    def __init__(self, ui, cli):
+        self.ui, self.cli, self.out, self.ready = ui, cli, None, False
+        self.seen, self.fusion, self.failed = set(), 0, 0
+        _status[0] = self
+        pal = ui.palettes.itemById(PALETTE_ID)
+        if pal:
+            self.ready = True
+        else:
+            pal = ui.palettes.add(PALETTE_ID, "Export to SolidCraft", os.path.join(HERE, "status.html"),
+                                  True, True, True, 380, 520)
+            pal.dockingState = adsk.core.PaletteDockingStates.PaletteDockStateFloating
+            h = StatusHandler()
+            pal.incomingFromHTML.add(h)
+            _handlers.append(h)
+        _status[0] = self
+        self.palette = pal
+        pal.isVisible = True
+        import time
+        t = time.time()
+        while not self.ready and time.time() - t < 5:  # the page loads in the background
+            adsk.doEvents()
+            time.sleep(0.02)
+        self.ready = True  # if it never said so, send anyway
+        self.show(reset=True)
+
+    def show(self, **m):
+        if self.ready:
+            try:
+                self.palette.sendInfoToHTML("show", json.dumps(m))
+            except Exception:
+                pass
+        adsk.doEvents()
+
+    def line(self, kind, text):
+        if kind == "fusion":
+            self.fusion += 1
+        elif kind == "failed":
+            self.failed += 1
+        self.show(lines=[[kind, text]], fusion=self.fusion, failed=self.failed,
+                  kept=max(len(self.seen) - self.fusion, 0))
+
+
+_status = [None]
+
+
 class Exporter:
     """Fusion's own result of a step, for steps SolidCraft can't rebuild the same."""
 
@@ -72,7 +165,7 @@ class Exporter:
         return extract.export_step(self.design, index, components, self.folder)
 
 
-def convert(app, ui, doc, out, cli, progress, done):
+def convert(app, ui, doc, out, cli, progress, done, status):
     """Convert one document (its linked designs first) to `out`; returns the report lines."""
     import extract
     import build
@@ -90,10 +183,12 @@ def convert(app, ui, doc, out, cli, progress, done):
             done.add(name)
             sub = app.documents.open(occ.documentReference.dataFile, True)
             try:
-                convert(app, ui, sub, target, cli, progress, done)
+                convert(app, ui, sub, target, cli, progress, done, status)
             finally:
                 doc.activate()
     tl = design.timeline
+    status.seen, status.fusion, status.failed = set(), 0, 0
+    status.show(title=doc.name, phase="Reading the timeline…", value=0, max=1, kept="–", fusion=0, failed=0)
     data = {"document": doc.name, "units": design.unitsManager.defaultLengthUnits,
             "parameters": extract.parameters(design), "occurrences": extract.components(design),
             "count": tl.count, "steps": []}
@@ -102,22 +197,35 @@ def convert(app, ui, doc, out, cli, progress, done):
     for i in range(tl.count):
         progress.message = "%s: reading step %d of %d" % (doc.name, i + 1, tl.count)
         progress.progressValue = i
-        adsk.doEvents()
+        status.show(phase="Reading step %d of %d: %s" % (i + 1, tl.count, tl.item(i).name), value=i, max=2 * tl.count)
         if progress.wasCancelled:
             raise RuntimeError("cancelled")
-        data["steps"] += extract.extract(design, i, i + 1, sketches)["steps"]
+        got = extract.extract(design, i, i + 1, sketches)["steps"]
+        for st in got:
+            if st.get("error"):
+                status.line("note", "%s: couldn't read it (%s)" % (st["name"], st["error"]))
+        data["steps"] += got
     data["looks"] = extract.looks(design)
     with open(os.path.splitext(out)[0] + ".fusion.json", "w") as f:
         json.dump(data, f)
     progress.message = "%s: building in SolidCraft…" % doc.name
-    adsk.doEvents()
-    def tick(i, n):
+    status.show(phase="Building in SolidCraft…")
+    count = max(tl.count, 1)
+
+    def tick(i, n, name):
+        if name:
+            status.seen.add(name)
         if i % 10 == 0:
             progress.maximumValue = max(n, 1)
             progress.progressValue = i
             progress.message = "%s: building in SolidCraft (%d of %d)" % (doc.name, i, n)
-            adsk.doEvents()
-    return build.build(data, out, cli, exporter=Exporter(design, folder), tick=tick)
+            status.show(phase="Building in SolidCraft: %s" % (name or "finishing"), value=count + count * i / max(n, 1),
+                        max=2 * count, kept=max(len(status.seen) - status.fusion, 0))
+            if progress.wasCancelled:
+                raise RuntimeError("cancelled")
+    report = build.build(data, out, cli, exporter=Exporter(design, folder), tick=tick, event=status.line)
+    status.show(value=1, max=1, kept=max(len(status.seen) - status.fusion, 0))
+    return report
 
 
 class ExecuteHandler(adsk.core.CommandEventHandler):
@@ -150,29 +258,25 @@ class ExecuteHandler(adsk.core.CommandEventHandler):
                 out += ".solidcraft"
             s["folder"] = os.path.dirname(out)
             save_settings(s)
+            status = Status(ui, cli)
             progress = ui.createProgressDialog()
             progress.isCancelButtonShown = True
             progress.show("Export to SolidCraft", "Starting…", 0, 1, 0)
             try:
-                report = convert(app, ui, doc, out, cli, progress, set())
+                report = convert(app, ui, doc, out, cli, progress, set(), status)
             finally:
                 progress.hide()
-            summary = "\n".join(report[2:4])
-            if ui.messageBox("Exported to\n%s\n\n%s\n\nThe full report is next to it. Open it in SolidCraft?" % (out, summary),
-                             "Export to SolidCraft", adsk.core.MessageBoxButtonTypes.YesNoButtonType) == adsk.core.DialogResults.DialogYes:
-                appl = find_app(cli)
-                if platform.system() == "Darwin":
-                    if appl and appl.endswith(".app"):
-                        subprocess.Popen(["open", "-a", appl, out])
-                    elif appl:
-                        subprocess.Popen([appl, out], start_new_session=True)
-                    else:
-                        subprocess.Popen(["open", out])
-                else:
-                    subprocess.Popen([appl or out, out] if appl else ["cmd", "/c", "start", "", out])
+            status.out = out
+            status.show(title=doc.name, phase="Done. Saved to " + out,
+                        summary="\n".join(report[2:4]), done=True)
         except Exception:
+            st = _status[0]
             if "cancelled" in traceback.format_exc():
+                if st:
+                    st.show(phase="Cancelled.")
                 return
+            if st:
+                st.show(phase="Failed.", lines=[["failed", traceback.format_exc().strip().splitlines()[-1]]])
             ui.messageBox("Export to SolidCraft failed:\n" + traceback.format_exc())
 
 
@@ -201,6 +305,9 @@ def run(context):
 
 def stop(context):
     ui = adsk.core.Application.get().userInterface
+    pal = ui.palettes.itemById(PALETTE_ID)
+    if pal:
+        pal.deleteMe()
     panel = ui.allToolbarPanels.itemById("SolidScriptsAddinsPanel")
     c = panel.controls.itemById(CMD_ID) if panel else None
     if c:

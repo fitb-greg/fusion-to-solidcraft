@@ -25,6 +25,9 @@ class Session:
         self.p = subprocess.Popen([cli, "mcp", "--headless", "--allow-path", folder], stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         self.n = 0
+        # body -> (volume, centre) SolidCraft measures more than Fusion for Fusion's own result
+        # of it: SolidCraft's volume of some freeform faces is off. Later steps compare changes.
+        self.offsets = {}
         self.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "fusion2solidcraft", "version": "1"}})
         self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
@@ -181,6 +184,18 @@ def delta_matches(before, now, want):
     return abs(got[0] - want[0]) <= tol_v and math.sqrt(sum((a - b) ** 2 for a, b in zip(got[1:], want[1:]))) <= tol_m
 
 
+def measured(s, k, b):
+    """SolidCraft's volume and centre of body `k`, less what it measured more than Fusion when
+    Fusion's result came in."""
+    sv, c = b.get("volume_mm3"), b.get("center_of_mass")
+    off = s.offsets.get(k)
+    if off and sv is not None:
+        sv -= off[0]
+        if c:
+            c = [a - d for a, d in zip(c, off[1])]
+    return sv, c
+
+
 def mismatched(s, after, skip=(), tol=0.002):
     """Bodies that differ from Fusion's (wrong volume or place, or missing), and bodies Fusion
     doesn't have."""
@@ -190,9 +205,9 @@ def mismatched(s, after, skip=(), tol=0.002):
         if k.split("/", 1)[0] in skip or v.get("volume") is None:
             continue
         b = have.get(k)
-        sv = b.get("volume_mm3") if b else None
+        sv, c = measured(s, k, b) if b else (None, None)
         if (b is None or sv is None or abs(sv - v["volume"]) > tol * max(abs(v["volume"]), 1.0)
-                or (v.get("center") and b.get("center_of_mass") and dist(v["center"], b["center_of_mass"]) > 0.05 + 1e-4 * v["volume"] ** (1 / 3))):
+                or (v.get("center") and c and dist(v["center"], c) > 0.05 + 1e-4 * v["volume"] ** (1 / 3))):
             wrong.append(k)
     extra = [k for k in have if k not in after and k.split("/", 1)[0] not in skip]
     return wrong, extra
@@ -242,14 +257,16 @@ def replace_with_fusion(s, exporter, step, wrong, extra, log):
             old.append("%s (before step %d)" % (k, step["index"]) if ok else k)
         s.execute("solid.remove", {"bodies": old})
     done = True
+    # A component can come in more than one file (bodies Fusion won't show come separately).
+    wants = {f["component"]: {k.split("/", 1)[1]: k for k in wrong if k.split("/", 1)[0] == f["component"]} for f in files}
     for f in files:
-        want = {k.split("/", 1)[1]: k for k in wrong if k.split("/", 1)[0] == f["component"]}
+        want = wants[f["component"]]
         ok, r = s.execute("file.insert_step", {"path": f["path"], "name": "%s from Fusion" % step["name"], "matrix": f["matrix"], "names": "solid"})
         if not ok:
             log.append("step %d: importing Fusion's result failed: %s" % (step["index"], str(r)[:200]))
             done = False
             continue
-        # Unique names at once: a STEP name like "dust port" may come again in a later import,
+        # Unique names at once: a STEP name like "Body1" may come again in a later import,
         # and SolidCraft's later features find bodies by name.
         created = []
         for c in r.get("created_bodies", []):
@@ -279,10 +296,19 @@ def replace_with_fusion(s, exporter, step, wrong, extra, log):
             if not ok:
                 log.append("step %d: could not name Fusion's %s: %s" % (step["index"], target, str(r2)[:150]))
                 done = False
+                continue
+            s.offsets.pop(target, None)
+            v = after.get(target, {})
+            if b.get("volume_mm3") is not None and v.get("volume") and abs(b["volume_mm3"] - v["volume"]) > 0.002 * v["volume"]:
+                s.offsets[target] = (b["volume_mm3"] - v["volume"],
+                                     [a - d for a, d in zip(b.get("center_of_mass") or v.get("center", [0, 0, 0]), v.get("center", [0, 0, 0]))])
+                log.append("step %d: SolidCraft measures Fusion's own %s %.1f%% %s than Fusion does; later steps compare changes"
+                           % (step["index"], target, 100 * abs(b["volume_mm3"] / v["volume"] - 1), "smaller" if b["volume_mm3"] < v["volume"] else "larger"))
         if drop:
             ok, r = s.execute("solid.remove", {"bodies": drop})
             if not ok:
                 log.append("step %d: removing the rest of Fusion's export %s failed: %s" % (step["index"], drop, str(r)[:200]))
+    for want in wants.values():
         if want:
             log.append("step %d: Fusion's export lacked %s" % (step["index"], list(want.values())))
             done = False
@@ -302,18 +328,33 @@ def compare(s, after, step, log, tol=0.002, skip=()):
         if b is None:
             bad.append("%s missing" % k)
             continue
-        sv = b.get("volume_mm3")
+        sv, c = measured(s, k, b)
         if sv is None or abs(sv - fv) > tol * max(abs(fv), 1.0):
             bad.append("%s volume %s, Fusion %.1f" % (k, "open" if sv is None else "%.1f" % sv, fv))
-        elif v.get("center") and b.get("center_of_mass") and dist(v["center"], b["center_of_mass"]) > 0.05 + 1e-4 * fv ** (1 / 3):
-            bad.append("%s is %.1f mm from where Fusion has it" % (k, dist(v["center"], b["center_of_mass"])))
+        elif v.get("center") and c and dist(v["center"], c) > 0.05 + 1e-4 * fv ** (1 / 3):
+            bad.append("%s is %.1f mm from where Fusion has it" % (k, dist(v["center"], c)))
     extra = [k for k in have if k not in after and k.split("/", 1)[0] not in skip and not k.endswith(":%s)" % k.rsplit(":", 1)[-1][:-1])]
     if extra:
         bad.append("extra bodies %s" % extra)
     return bad
 
 
-def build(data, out, cli=DEFAULT_CLI, check_every_step=True, exporter=None, tick=None):
+class Watched(list):
+    """A list of report lines that also tells `event` about each one as it comes."""
+
+    def __init__(self, kind, event):
+        super().__init__()
+        self.kind, self.event = kind, event
+
+    def append(self, m):
+        super().append(m)
+        if self.event:
+            self.event(self.kind, m)
+
+
+def build(data, out, cli=DEFAULT_CLI, check_every_step=True, exporter=None, tick=None, event=None):
+    """`tick(i, n, step_name)` is called before each command, `event(kind, line)` for each step
+    brought in as Fusion's result ("fusion") and each failure ("failed")."""
     t = translate.Translator(data)
     commands, notes = t.run(), t.notes
     skip = t.linked_components()
@@ -327,7 +368,8 @@ def build(data, out, cli=DEFAULT_CLI, check_every_step=True, exporter=None, tick
                 notes.append((c["step"], "linked design %s not converted yet: convert it first" % p["linked"]))
     steps = {st["index"]: st for st in data["steps"]}
     s = Session(cli, os.path.dirname(os.path.abspath(out)))
-    log, dropped, failed, replaced = [], [], [], []
+    log, dropped = [], []
+    failed, replaced = Watched("failed", event), Watched("fusion", event)
     checked = set()
     end_checked = False
     occ_ids = {}  # component name -> occurrence id of an inserted design
@@ -336,9 +378,9 @@ def build(data, out, cli=DEFAULT_CLI, check_every_step=True, exporter=None, tick
     last_step = None
     try:
         for i, c in enumerate(commands):
-            if tick:
-                tick(i, len(commands))
             step = c.get("step")
+            if tick:
+                tick(i, len(commands), steps.get(step, {}).get("name"))
             if check_every_step and last_step is not None and step != last_step and last_step not in checked and "after" in steps.get(last_step, {}):
                 checked.add(last_step)
                 st = steps[last_step]
@@ -410,6 +452,8 @@ def build(data, out, cli=DEFAULT_CLI, check_every_step=True, exporter=None, tick
                     failed.append("placing a copy of %s: %s" % (c["params"]["component"], str(r2)[:200]))
             if c["command"] == "body.rename" and step is None:
                 final_names[c["params"]["body"]] = c["params"]["name"]
+                if c["params"]["body"] in s.offsets:
+                    s.offsets[c["params"]["name"]] = s.offsets.pop(c["params"]["body"])
             if c["command"] == "component.insert_design" and isinstance(r, dict) and r.get("occurrence") is not None:
                 occ_ids[c["params"].get("name")] = r["occurrence"]
             if c["command"] == "sketch.create" and isinstance(r, dict) and r.get("sketch") is not None:

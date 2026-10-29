@@ -41,8 +41,10 @@ More detail: [docs/how-it-works.md](docs/how-it-works.md).
 
 1. Open a design. It must be parametric, with a timeline.
 2. Click **Utilities → Export to SolidCraft** and choose where to save.
-3. When the export finishes, it can open the result in SolidCraft. A `<name>.report.txt` is saved
-   beside the design.
+3. A status window shows each step as it is read and built, how many steps keep their history,
+   and which ones come in as Fusion's result. When the export finishes it has buttons to open the
+   result in SolidCraft, show the report, or show the folder. The report is saved beside the design
+   as `<name>.report.txt`.
 
 Linked designs are exported as their own `.solidcraft` files and linked the same way.
 Fusion's window is busy while the export runs. Large designs take a few minutes.
@@ -79,6 +81,9 @@ features, sweeps along closed paths, delete face, base features, and sheet metal
 - 311-step assembly with 85 components and a linked design: about 300 steps keep their history.
   The rest are a sweep and nine splits that SolidCraft can't reproduce yet. All final bodies
   match Fusion.
+- 128-step multi-body part with lofts, sweeps, fillets and mirrors: 100 steps keep their history.
+  The other 28 are mostly fillets and mirrors SolidCraft can't build yet. All final bodies match
+  Fusion.
 
 ## Command line (development)
 
