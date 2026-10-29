@@ -53,18 +53,24 @@ Fusion's window is busy while the export runs. Large designs take a few minutes.
 - Design units
 - Sketches on their exact planes: lines, arcs and circles, with constraints and driving
   dimensions. Projected geometry is kept fixed. Splines become short lines for now.
-- Extrude: distance, two sides, symmetric, taper, start offset and through all; new, join, cut
-  and intersect
-- Combine, shell, offset faces, copy/paste and cut/paste of bodies, move, scale, remove, split
-  body, and rectangular pattern of bodies
+- Extrude: distance, two sides, symmetric, taper, start offset, through all, and To Object /
+  From Object; new, join, cut and intersect
+- Revolve, loft (without rails), fillet, chamfer, mirror (bodies and features), circular and
+  rectangular patterns
+- Combine, shell, offset faces, copy/paste and cut/paste of bodies, move, scale, remove, and
+  split body
+- Joints: the parts move where the joint puts them
 - Components, including components placed more than once
 - Hidden bodies and components
 - Appearances, as colour with metal or glass hints (textures don't carry over), and physical
   materials with their density
+- Feet-and-inch expressions such as `1'-6 1/2"`
 
-**Not mapped yet** (these come in as Fusion's result): fillet, chamfer, revolve, loft, hole,
-mirror, circular pattern, patterns of features, sweeps along closed paths, sheet metal and
-joints.
+Each of these is checked against Fusion as it is built. SolidCraft can't build every fillet or
+mirror yet; those steps come in as Fusion's result.
+
+**Not mapped yet** (these come in as Fusion's result): hole, patterns along a path, patterns of
+features, sweeps along closed paths, delete face, base features, and sheet metal.
 
 ## Results
 
@@ -87,6 +93,15 @@ python3 ExportToSolidCraft/build.py my-design.json out/my-design.solidcraft --fu
 
 `--fusion` lets a step that doesn't match fall back to Fusion's result. `--cli PATH` picks the
 `solidcraft-cli` to use; `SOLIDCRAFT_CLI` works too.
+
+## Tests
+
+```sh
+python3 -m unittest discover tests
+```
+
+The build test converts the demo with `solidcraft-cli` and checks that it matches Fusion. It is
+skipped if `solidcraft-cli` isn't found.
 
 ## Notes
 

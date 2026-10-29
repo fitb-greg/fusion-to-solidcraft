@@ -1,0 +1,1053 @@
+{
+ "document": "Untitled",
+ "units": "in",
+ "parameters": [
+  {
+   "name": "width",
+   "expression": "80 mm",
+   "unit": "mm",
+   "comment": ""
+  },
+  {
+   "name": "depth",
+   "expression": "50 mm",
+   "unit": "mm",
+   "comment": ""
+  },
+  {
+   "name": "height",
+   "expression": "30 mm",
+   "unit": "mm",
+   "comment": ""
+  },
+  {
+   "name": "wall",
+   "expression": "2.5 mm",
+   "unit": "mm",
+   "comment": ""
+  },
+  {
+   "name": "hole_d",
+   "expression": "8 mm",
+   "unit": "mm",
+   "comment": ""
+  },
+  {
+   "name": "lid_gap",
+   "expression": "10 mm",
+   "unit": "mm",
+   "comment": ""
+  }
+ ],
+ "occurrences": [],
+ "count": 9,
+ "steps": [
+  {
+   "index": 0,
+   "name": "Base",
+   "suppressed": false,
+   "type": "Sketch",
+   "sketch": {
+    "name": "Base",
+    "frame": {
+     "origin": [
+      0.0,
+      0.0,
+      0.0
+     ],
+     "x_dir": [
+      1.0,
+      0.0,
+      0.0
+     ],
+     "y_dir": [
+      0.0,
+      1.0,
+      0.0
+     ]
+    },
+    "points": [
+     {
+      "id": "P0",
+      "at": [
+       0.0,
+       0.0
+      ],
+      "fixed": true,
+      "ref": false
+     },
+     {
+      "id": "P1",
+      "at": [
+       40.0,
+       25.0
+      ],
+      "fixed": false,
+      "ref": false
+     },
+     {
+      "id": "P2",
+      "at": [
+       -40.0,
+       25.0
+      ],
+      "fixed": false,
+      "ref": false
+     },
+     {
+      "id": "P3",
+      "at": [
+       -40.0,
+       -25.0
+      ],
+      "fixed": false,
+      "ref": false
+     },
+     {
+      "id": "P4",
+      "at": [
+       40.0,
+       -25.0
+      ],
+      "fixed": false,
+      "ref": false
+     }
+    ],
+    "curves": [
+     {
+      "id": "C0",
+      "construction": false,
+      "ref": false,
+      "fixed": false,
+      "kind": "line",
+      "a": "P1",
+      "b": "P2"
+     },
+     {
+      "id": "C1",
+      "construction": false,
+      "ref": false,
+      "fixed": false,
+      "kind": "line",
+      "a": "P2",
+      "b": "P3"
+     },
+     {
+      "id": "C2",
+      "construction": false,
+      "ref": false,
+      "fixed": false,
+      "kind": "line",
+      "a": "P3",
+      "b": "P4"
+     },
+     {
+      "id": "C3",
+      "construction": false,
+      "ref": false,
+      "fixed": false,
+      "kind": "line",
+      "a": "P4",
+      "b": "P1"
+     },
+     {
+      "id": "C4",
+      "construction": true,
+      "ref": false,
+      "fixed": false,
+      "kind": "line",
+      "a": "P1",
+      "b": "P3"
+     }
+    ],
+    "constraints": [
+     {
+      "kind": "Horizontal",
+      "line": "C0"
+     },
+     {
+      "kind": "Horizontal",
+      "line": "C2"
+     },
+     {
+      "kind": "Vertical",
+      "line": "C1"
+     },
+     {
+      "kind": "Vertical",
+      "line": "C3"
+     },
+     {
+      "kind": "MidPoint",
+      "point": "P0",
+      "midPointCurve": "C4"
+     }
+    ],
+    "dimensions": [
+     {
+      "kind": "Linear",
+      "expr": "width",
+      "driving": true,
+      "value": 8.0,
+      "entityOne": "P1",
+      "entityTwo": "P2",
+      "orientation": 1,
+      "text": [
+       0.0,
+       40.0
+      ]
+     },
+     {
+      "kind": "Linear",
+      "expr": "depth",
+      "driving": true,
+      "value": 5.0,
+      "entityOne": "P2",
+      "entityTwo": "P3",
+      "orientation": 2,
+      "text": [
+       60.0,
+       0.0
+      ]
+     }
+    ],
+    "profiles": [
+     [
+      {
+       "outer": true,
+       "curves": [
+        "C3",
+        "C0",
+        "C1",
+        "C2"
+       ]
+      }
+     ]
+    ],
+    "uid": "(Unsaved)/Base#0",
+    "component": "(Unsaved)"
+   },
+   "health": 0,
+   "after": {}
+  },
+  {
+   "index": 1,
+   "name": "Extrude1",
+   "suppressed": false,
+   "type": "ExtrudeFeature",
+   "component": "(Unsaved)",
+   "feature": {
+    "operation": "new",
+    "two_sided": false,
+    "one": {
+     "type": "DistanceExtentDefinition",
+     "expr": "height",
+     "value": 30.0
+    },
+    "symmetric": false,
+    "profiles": [
+     {
+      "sketch": "(Unsaved)/Base#0",
+      "loops": [
+       {
+        "outer": true,
+        "curves": [
+         "C3",
+         "C0",
+         "C1",
+         "C2"
+        ]
+       }
+      ],
+      "point": [
+       0.0,
+       0.0
+      ],
+      "area": 4000.0,
+      "centroid": [
+       0.0,
+       0.0
+      ]
+     }
+    ],
+    "participants": [],
+    "bodies": []
+   },
+   "health": 0,
+   "after": {
+    "(Unsaved)/Box": {
+     "volume": 120000.0,
+     "visible": true,
+     "center": [
+      0.0,
+      -0.0,
+      15.0
+     ],
+     "bbox": [
+      [
+       -40.0,
+       -25.0,
+       0.0
+      ],
+      [
+       40.0,
+       25.0,
+       30.0
+      ]
+     ]
+    }
+   }
+  },
+  {
+   "index": 2,
+   "name": "Shell1",
+   "suppressed": false,
+   "type": "ShellFeature",
+   "component": "(Unsaved)",
+   "feature": {
+    "faces": [
+     [
+      0.0,
+      0.0,
+      30.0
+     ]
+    ],
+    "face_bodies": [
+     "(Unsaved)/Box"
+    ],
+    "bodies_in": [],
+    "inside": "wall",
+    "outside": null,
+    "tangent_chain": false,
+    "bodies": [
+     "(Unsaved)/Box"
+    ],
+    "body": "(Unsaved)/Box"
+   },
+   "health": 0,
+   "after": {
+    "(Unsaved)/Box": {
+     "volume": 27187.5,
+     "visible": true,
+     "center": [
+      0.0,
+      -0.0,
+      10.732759
+     ],
+     "bbox": [
+      [
+       -40.0,
+       -25.0,
+       0.0
+      ],
+      [
+       40.0,
+       25.0,
+       30.0
+      ]
+     ]
+    }
+   }
+  },
+  {
+   "index": 3,
+   "name": "Hole",
+   "suppressed": false,
+   "type": "Sketch",
+   "sketch": {
+    "name": "Hole",
+    "frame": {
+     "origin": [
+      0.0,
+      0.0,
+      0.0
+     ],
+     "x_dir": [
+      1.0,
+      0.0,
+      0.0
+     ],
+     "y_dir": [
+      0.0,
+      0.0,
+      -1.0
+     ]
+    },
+    "points": [
+     {
+      "id": "P0",
+      "at": [
+       0.0,
+       0.0
+      ],
+      "fixed": true,
+      "ref": false
+     },
+     {
+      "id": "P1",
+      "at": [
+       0.0,
+       -15.0
+      ],
+      "fixed": false,
+      "ref": false
+     }
+    ],
+    "curves": [
+     {
+      "id": "C0",
+      "construction": false,
+      "ref": false,
+      "fixed": false,
+      "kind": "circle",
+      "center": "P1",
+      "r": 4.0
+     }
+    ],
+    "constraints": [],
+    "dimensions": [
+     {
+      "kind": "Diameter",
+      "expr": "hole_d",
+      "driving": true,
+      "value": 0.8,
+      "entity": "C0",
+      "text": [
+       10.0,
+       -20.0
+      ]
+     }
+    ],
+    "profiles": [
+     [
+      {
+       "outer": true,
+       "curves": [
+        "C0"
+       ]
+      }
+     ]
+    ],
+    "uid": "(Unsaved)/Hole#3",
+    "component": "(Unsaved)"
+   },
+   "health": 0,
+   "after": {
+    "(Unsaved)/Box": {
+     "volume": 27187.5,
+     "visible": true,
+     "center": [
+      0.0,
+      -0.0,
+      10.732759
+     ],
+     "bbox": [
+      [
+       -40.0,
+       -25.0,
+       0.0
+      ],
+      [
+       40.0,
+       25.0,
+       30.0
+      ]
+     ]
+    }
+   }
+  },
+  {
+   "index": 4,
+   "name": "Extrude2",
+   "suppressed": false,
+   "type": "ExtrudeFeature",
+   "component": "(Unsaved)",
+   "feature": {
+    "operation": "cut",
+    "two_sided": false,
+    "one": {
+     "type": "ThroughAllExtentDefinition",
+     "positive": false
+    },
+    "symmetric": false,
+    "profiles": [
+     {
+      "sketch": "(Unsaved)/Hole#3",
+      "loops": [
+       {
+        "outer": true,
+        "curves": [
+         "C0"
+        ]
+       }
+      ],
+      "point": null,
+      "area": 50.2654824574367,
+      "centroid": [
+       0.0,
+       -15.0
+      ]
+     }
+    ],
+    "participants": [
+     "(Unsaved)/Box"
+    ],
+    "bodies": [
+     "(Unsaved)/Box"
+    ]
+   },
+   "health": 0,
+   "after": {
+    "(Unsaved)/Box": {
+     "volume": 27061.836,
+     "visible": true,
+     "center": [
+      0.0,
+      0.110285,
+      10.712943
+     ],
+     "bbox": [
+      [
+       -40.0,
+       -25.0,
+       0.0
+      ],
+      [
+       40.0,
+       25.0,
+       30.0
+      ]
+     ]
+    }
+   }
+  },
+  {
+   "index": 5,
+   "name": "Lid",
+   "suppressed": false,
+   "type": "Sketch",
+   "sketch": {
+    "name": "Lid",
+    "frame": {
+     "origin": [
+      0.0,
+      0.0,
+      0.0
+     ],
+     "x_dir": [
+      1.0,
+      0.0,
+      0.0
+     ],
+     "y_dir": [
+      0.0,
+      1.0,
+      0.0
+     ]
+    },
+    "points": [
+     {
+      "id": "P0",
+      "at": [
+       0.0,
+       0.0
+      ],
+      "fixed": true,
+      "ref": false
+     },
+     {
+      "id": "P1",
+      "at": [
+       40.0,
+       25.0
+      ],
+      "fixed": false,
+      "ref": false
+     },
+     {
+      "id": "P2",
+      "at": [
+       -40.0,
+       25.0
+      ],
+      "fixed": false,
+      "ref": false
+     },
+     {
+      "id": "P3",
+      "at": [
+       -40.0,
+       -25.0
+      ],
+      "fixed": false,
+      "ref": false
+     },
+     {
+      "id": "P4",
+      "at": [
+       40.0,
+       -25.0
+      ],
+      "fixed": false,
+      "ref": false
+     }
+    ],
+    "curves": [
+     {
+      "id": "C0",
+      "construction": false,
+      "ref": false,
+      "fixed": false,
+      "kind": "line",
+      "a": "P1",
+      "b": "P2"
+     },
+     {
+      "id": "C1",
+      "construction": false,
+      "ref": false,
+      "fixed": false,
+      "kind": "line",
+      "a": "P2",
+      "b": "P3"
+     },
+     {
+      "id": "C2",
+      "construction": false,
+      "ref": false,
+      "fixed": false,
+      "kind": "line",
+      "a": "P3",
+      "b": "P4"
+     },
+     {
+      "id": "C3",
+      "construction": false,
+      "ref": false,
+      "fixed": false,
+      "kind": "line",
+      "a": "P4",
+      "b": "P1"
+     },
+     {
+      "id": "C4",
+      "construction": true,
+      "ref": false,
+      "fixed": false,
+      "kind": "line",
+      "a": "P1",
+      "b": "P3"
+     }
+    ],
+    "constraints": [
+     {
+      "kind": "Horizontal",
+      "line": "C0"
+     },
+     {
+      "kind": "Horizontal",
+      "line": "C2"
+     },
+     {
+      "kind": "Vertical",
+      "line": "C1"
+     },
+     {
+      "kind": "Vertical",
+      "line": "C3"
+     },
+     {
+      "kind": "MidPoint",
+      "point": "P0",
+      "midPointCurve": "C4"
+     }
+    ],
+    "dimensions": [
+     {
+      "kind": "Linear",
+      "expr": "width",
+      "driving": true,
+      "value": 8.0,
+      "entityOne": "P1",
+      "entityTwo": "P2",
+      "orientation": 1,
+      "text": [
+       0.0,
+       40.0
+      ]
+     },
+     {
+      "kind": "Linear",
+      "expr": "depth",
+      "driving": true,
+      "value": 5.0,
+      "entityOne": "P2",
+      "entityTwo": "P3",
+      "orientation": 2,
+      "text": [
+       60.0,
+       0.0
+      ]
+     }
+    ],
+    "profiles": [
+     [
+      {
+       "outer": true,
+       "curves": [
+        "C3",
+        "C0",
+        "C1",
+        "C2"
+       ]
+      }
+     ]
+    ],
+    "uid": "(Unsaved)/Lid#5",
+    "component": "(Unsaved)"
+   },
+   "health": 0,
+   "after": {
+    "(Unsaved)/Box": {
+     "volume": 27061.836,
+     "visible": true,
+     "center": [
+      0.0,
+      0.110285,
+      10.712943
+     ],
+     "bbox": [
+      [
+       -40.0,
+       -25.0,
+       0.0
+      ],
+      [
+       40.0,
+       25.0,
+       30.0
+      ]
+     ]
+    }
+   }
+  },
+  {
+   "index": 6,
+   "name": "Extrude3",
+   "suppressed": false,
+   "type": "ExtrudeFeature",
+   "component": "(Unsaved)",
+   "feature": {
+    "operation": "new",
+    "two_sided": false,
+    "one": {
+     "type": "DistanceExtentDefinition",
+     "expr": "wall",
+     "value": 2.5
+    },
+    "symmetric": false,
+    "start_offset": "height + lid_gap",
+    "profiles": [
+     {
+      "sketch": "(Unsaved)/Lid#5",
+      "loops": [
+       {
+        "outer": true,
+        "curves": [
+         "C3",
+         "C0",
+         "C1",
+         "C2"
+        ]
+       }
+      ],
+      "point": [
+       0.0,
+       0.0
+      ],
+      "area": 4000.0,
+      "centroid": [
+       0.0,
+       0.0
+      ]
+     }
+    ],
+    "participants": [],
+    "bodies": []
+   },
+   "health": 0,
+   "after": {
+    "(Unsaved)/Box": {
+     "volume": 27061.836,
+     "visible": true,
+     "center": [
+      0.0,
+      0.110285,
+      10.712943
+     ],
+     "bbox": [
+      [
+       -40.0,
+       -25.0,
+       0.0
+      ],
+      [
+       40.0,
+       25.0,
+       30.0
+      ]
+     ]
+    },
+    "(Unsaved)/Lid": {
+     "volume": 10000.0,
+     "visible": true,
+     "center": [
+      0.0,
+      0.0,
+      41.25
+     ],
+     "bbox": [
+      [
+       -40.0,
+       -25.0,
+       40.0
+      ],
+      [
+       40.0,
+       25.0,
+       42.5
+      ]
+     ]
+    }
+   }
+  },
+  {
+   "index": 7,
+   "name": "Knob",
+   "suppressed": false,
+   "type": "Sketch",
+   "sketch": {
+    "name": "Knob",
+    "frame": {
+     "origin": [
+      0.0,
+      0.0,
+      0.0
+     ],
+     "x_dir": [
+      1.0,
+      0.0,
+      0.0
+     ],
+     "y_dir": [
+      0.0,
+      1.0,
+      0.0
+     ]
+    },
+    "points": [
+     {
+      "id": "P0",
+      "at": [
+       0.0,
+       0.0
+      ],
+      "fixed": true,
+      "ref": false
+     },
+     {
+      "id": "P1",
+      "at": [
+       0.0,
+       0.0
+      ],
+      "fixed": false,
+      "ref": false
+     }
+    ],
+    "curves": [
+     {
+      "id": "C0",
+      "construction": false,
+      "ref": false,
+      "fixed": false,
+      "kind": "circle",
+      "center": "P1",
+      "r": 6.0
+     }
+    ],
+    "constraints": [],
+    "dimensions": [],
+    "profiles": [
+     [
+      {
+       "outer": true,
+       "curves": [
+        "C0"
+       ]
+      }
+     ]
+    ],
+    "uid": "(Unsaved)/Knob#7",
+    "component": "(Unsaved)"
+   },
+   "health": 0,
+   "after": {
+    "(Unsaved)/Box": {
+     "volume": 27061.836,
+     "visible": true,
+     "center": [
+      0.0,
+      0.110285,
+      10.712943
+     ],
+     "bbox": [
+      [
+       -40.0,
+       -25.0,
+       0.0
+      ],
+      [
+       40.0,
+       25.0,
+       30.0
+      ]
+     ]
+    },
+    "(Unsaved)/Lid": {
+     "volume": 10000.0,
+     "visible": true,
+     "center": [
+      0.0,
+      0.0,
+      41.25
+     ],
+     "bbox": [
+      [
+       -40.0,
+       -25.0,
+       40.0
+      ],
+      [
+       40.0,
+       25.0,
+       42.5
+      ]
+     ]
+    }
+   }
+  },
+  {
+   "index": 8,
+   "name": "Extrude4",
+   "suppressed": false,
+   "type": "ExtrudeFeature",
+   "component": "(Unsaved)",
+   "feature": {
+    "operation": "join",
+    "two_sided": false,
+    "one": {
+     "type": "DistanceExtentDefinition",
+     "expr": "wall + 6 mm",
+     "value": 8.5
+    },
+    "symmetric": false,
+    "start_offset": "height + lid_gap",
+    "profiles": [
+     {
+      "sketch": "(Unsaved)/Knob#7",
+      "loops": [
+       {
+        "outer": true,
+        "curves": [
+         "C0"
+        ]
+       }
+      ],
+      "point": null,
+      "area": 113.09733552923255,
+      "centroid": [
+       0.0,
+       0.0
+      ]
+     }
+    ],
+    "participants": [
+     "(Unsaved)/Lid"
+    ],
+    "bodies": [
+     "(Unsaved)/Lid"
+    ]
+   },
+   "health": 0,
+   "after": {
+    "(Unsaved)/Box": {
+     "volume": 27061.836,
+     "visible": true,
+     "center": [
+      0.0,
+      0.110285,
+      10.712943
+     ],
+     "bbox": [
+      [
+       -40.0,
+       -25.0,
+       0.0
+      ],
+      [
+       40.0,
+       25.0,
+       30.0
+      ]
+     ]
+    },
+    "(Unsaved)/Lid": {
+     "volume": 10678.584,
+     "visible": true,
+     "center": [
+      0.0,
+      0.0,
+      41.520072
+     ],
+     "bbox": [
+      [
+       -40.0,
+       -25.0,
+       40.0
+      ],
+      [
+       40.0,
+       25.0,
+       48.5
+      ]
+     ]
+    }
+   }
+  }
+ ],
+ "looks": {
+  "(Unsaved)/Box": {
+   "appearance": {
+    "name": "Plastic - Matte (Blue)",
+    "color": "#303b96"
+   },
+   "material": {
+    "name": "Plywood, Finish",
+    "density_g_cm3": 0.552
+   }
+  },
+  "(Unsaved)/Lid": {
+   "appearance": {
+    "name": "Aluminum - Satin",
+    "color": "#f5f5f6",
+    "metallic": 1.0,
+    "roughness": 0.35
+   },
+   "material": {
+    "name": "Plywood, Finish",
+    "density_g_cm3": 0.552
+   }
+  }
+ }
+}

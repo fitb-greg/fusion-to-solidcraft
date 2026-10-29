@@ -164,6 +164,23 @@ def matched_profiles(s, params, match, log, step):
     return dict(params, profiles=picks, exact_regions=True)
 
 
+def totals(s):
+    """All bodies' volume and its moment about the origin."""
+    v, m = 0.0, [0.0, 0.0, 0.0]
+    for b in s.bodies().values():
+        if b.get("volume_mm3") and b.get("center_of_mass"):
+            v += b["volume_mm3"]
+            m = [a + b["volume_mm3"] * c for a, c in zip(m, b["center_of_mass"])]
+    return [v] + m
+
+
+def delta_matches(before, now, want):
+    got = [a - b for a, b in zip(now, before)]
+    tol_v = 0.005 * abs(want[0]) + 0.5
+    tol_m = 0.005 * math.sqrt(sum(x * x for x in want[1:])) + 0.05 * abs(want[0]) + 5.0
+    return abs(got[0] - want[0]) <= tol_v and math.sqrt(sum((a - b) ** 2 for a, b in zip(got[1:], want[1:]))) <= tol_m
+
+
 def mismatched(s, after, skip=(), tol=0.002):
     """Bodies that differ from Fusion's (wrong volume or place, or missing), and bodies Fusion
     doesn't have."""
@@ -203,8 +220,11 @@ def rename_strays(s, after, wrong, extra):
 def replace_with_fusion(s, exporter, step, wrong, extra, log):
     """Put Fusion's own result for these bodies in place (no history for them up to here)."""
     rename_strays(s, step["after"], wrong, extra)
+    extra = [x for x in extra if x in s.bodies()]
     if extra:
-        s.execute("solid.remove", {"bodies": extra})
+        ok, r = s.execute("solid.remove", {"bodies": extra})
+        if not ok:
+            log.append("step %d: removing %s failed: %s" % (step["index"], extra, str(r)[:200]))
     if not wrong:
         return True
     comps = sorted({k.split("/", 1)[0] for k in wrong})
@@ -229,12 +249,21 @@ def replace_with_fusion(s, exporter, step, wrong, extra, log):
             log.append("step %d: importing Fusion's result failed: %s" % (step["index"], str(r)[:200]))
             done = False
             continue
+        # Unique names at once: a STEP name like "dust port" may come again in a later import,
+        # and SolidCraft's later features find bodies by name.
+        created = []
+        for c in r.get("created_bodies", []):
+            u = "%s [Fusion step %d]" % (c, step["index"])
+            ok2, _ = s.execute("body.rename", {"body": c, "name": u})
+            created.append((c, u if ok2 else c))
         drop = []
         have = s.bodies()
+        if os.environ.get("F2S_DEBUG"):
+            print("import step %d: created %s; want %s" % (step["index"], r.get("created_bodies"), want), file=sys.stderr, flush=True)
         after = step["after"]
-        for c in r.get("created_bodies", []):
+        for orig, c in created:
             b = have.get(c, {})
-            target = want.pop(c, None) if c in want else None
+            target = want.pop(orig, None) if orig in want else None
             if target is None and b.get("volume_mm3") is not None:
                 # Fusion's STEP names duplicates its own way: find it by volume and place.
                 for name, k in list(want.items()):
@@ -251,7 +280,9 @@ def replace_with_fusion(s, exporter, step, wrong, extra, log):
                 log.append("step %d: could not name Fusion's %s: %s" % (step["index"], target, str(r2)[:150]))
                 done = False
         if drop:
-            s.execute("solid.remove", {"bodies": drop})
+            ok, r = s.execute("solid.remove", {"bodies": drop})
+            if not ok:
+                log.append("step %d: removing the rest of Fusion's export %s failed: %s" % (step["index"], drop, str(r)[:200]))
         if want:
             log.append("step %d: Fusion's export lacked %s" % (step["index"], list(want.values())))
             done = False
@@ -340,8 +371,26 @@ def build(data, out, cli=DEFAULT_CLI, check_every_step=True, exporter=None, tick
                 params = dict(params, sketch=sketch_ids[params["sketch"]])
             if c.get("match"):
                 params = matched_profiles(s, params, c["match"], log, step) or params
+            before = totals(s) if c.get("tries") and c.get("delta") else None
             ok, r = s.execute(c["command"], params)
             first = r
+            if ok and before is not None and not delta_matches(before, totals(s), c["delta"]):
+                # Built, but not as Fusion has it: try the other ways (flipped, axis reversed).
+                for t in c["tries"]:
+                    if not t or not s.tool("undo", {})[0]:
+                        break
+                    ok2, r2 = s.execute(c["command"], t)
+                    if ok2 and delta_matches(before, totals(s), c["delta"]):
+                        log.append("step %s %s: built the other way round" % (step, c["command"]))
+                        r = r2
+                        break
+                    if ok2:
+                        s.tool("undo", {})
+                    ok3, r3 = s.execute(c["command"], params)
+                    if not ok3:
+                        ok, r = ok2, r2
+                        break
+                    r = r3
             for alt in c.get("alts") or []:
                 if ok:
                     break

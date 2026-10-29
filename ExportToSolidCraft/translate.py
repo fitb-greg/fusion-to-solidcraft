@@ -6,8 +6,28 @@ so the shape is right without them.
 """
 
 import math
+import re
 
 ROOT = None  # set per design: the root component's name
+
+
+# Fusion's feet-and-inches form: 1'-6 1/2" is 1 ft 6.5 in, not 1 ft minus 6.5 in.
+FT_IN = re.compile(r"""(\d+(?:\.\d+)?)\s*'\s*-\s*(\d+(?:\.\d+)?(?:\s+\d+/\d+)?|\d+/\d+)\s*\"""")
+NAME_KEYS = {"name", "body", "bodies", "targets", "target", "tools", "component", "new_name", "body_name", "material", "comment"}
+
+
+def feet_inches(v, key=None):
+    if isinstance(v, str):
+        return FT_IN.sub(r"""(\1' + \2")""", v) if key not in NAME_KEYS and "'" in v else v
+    if isinstance(v, dict):
+        return {k: feet_inches(x, k) for k, x in v.items()}
+    if isinstance(v, list):
+        return [feet_inches(x, key) for x in v]
+    return v
+
+
+def is_zero(e):
+    return not e or re.fullmatch(r"\s*[-+]?0*\.?0*\s*(mm|cm|m|in|ft|\"|')?\s*", e) is not None
 
 
 def norm(v):
@@ -22,10 +42,15 @@ class Translator:
         self.sketch_names = {}  # sketch uid -> SolidCraft sketch name
         self.notes = []  # (step index, message) for what could not be carried over
         self.step = None
+        self.features = {}  # (component, Fusion feature name) -> SolidCraft feature name
         global ROOT
         ROOT = data["document"].split(" v")[0]
 
     def emit(self, command, params, optional=False, **meta):
+        params = feet_inches(params)
+        for k in ("alts", "tries"):
+            if meta.get(k):
+                meta[k] = [feet_inches(a) for a in meta[k]]
         c = {"command": command, "params": params, "step": self.step, "optional": optional}
         c.update(meta)
         self.out.append(c)
@@ -331,7 +356,7 @@ class Translator:
     def f_ExtrudeFeature(self, s, f, new, gone, after):
         sketch, profs, points = self.profiles(f)
         faces = [p["face"] for p in f.get("profiles", []) if "face" in p]
-        params = {"name": s["name"]}
+        params = {"name": self.fname(s)}
         if profs:
             params.update(sketch=sketch, profiles=profs)
         elif faces:
@@ -344,6 +369,10 @@ class Translator:
             params["distance"] = one["expr"] if one.get("whole") else "2 * (%s)" % one["expr"]
         elif one["type"] == "DistanceExtentDefinition":
             params["distance"] = one["expr"]
+        elif one["type"] == "ToEntityExtentDefinition" and one.get("to") and not f.get("two_sided"):
+            params["to"] = one["to"]
+            if not is_zero(one.get("to_offset")):
+                params["to_offset"] = one["to_offset"]
         elif one["type"] == "ThroughAllExtentDefinition":
             params["through_all"] = True
             if one.get("positive") is False:
@@ -367,6 +396,8 @@ class Translator:
             params["taper"] = f["taper"]
         if f.get("start_offset"):
             params["start_offset"] = f["start_offset"]
+        elif f.get("from") and is_zero(f.get("from_offset")) and "to" in params:
+            params["from"] = f["from"]
         elif f.get("start"):
             return self.fallback(s, new, after)
         op = f["operation"]
@@ -428,16 +459,42 @@ class Translator:
             self.emit("body.rename", {"body": a, "name": b})
 
     def f_MoveFeature(self, s, f, new, gone, after):
-        m = f["matrix"]
+        self.move(f["bodies_in"], f["matrix"], new)
+
+    def f_Joint(self, s, f, new, gone, after):
+        """A joint moves its components: their bodies move by the change in placement."""
+        before, now = s.get("placements_before"), s.get("placements_after")
+        if before is None or now is None:
+            return self.fallback(s, new, after)
+        moved = False
+        for comp, m1 in now.items():
+            m0 = before.get(comp)
+            if m0 is None or max(abs(a - b) for a, b in zip(m0, m1)) < 1e-9:
+                continue
+            bodies = [k for k in self.prev if k.split("/", 1)[0] == comp]
+            if bodies:
+                d = mul(mat4(m1), invert_rigid(mat4(m0)))
+                self.move(bodies, [v for row in d for v in row], new)
+                moved = True
+        if not moved and any(k in after and self.prev.get(k, {}).get("center") != after[k].get("center") for k in self.prev):
+            return self.fallback(s, new, after)
+
+    f_AsBuiltJoint = f_Joint
+    f_RigidGroup = f_Joint
+
+    def move(self, bodies, m, new):
+        """Move bodies by a row-major 4x4 (translation in cm)."""
         R = [[m[0], m[1], m[2]], [m[4], m[5], m[6]], [m[8], m[9], m[10]]]
         t = [m[3] * 10, m[7] * 10, m[11] * 10]
-        params = {"bodies": f["bodies_in"]}
+        params = {"bodies": bodies}
         # Rotation about the world origin, then the move.
         tr = R[0][0] + R[1][1] + R[2][2]
         ang = math.acos(max(-1.0, min(1.0, (tr - 1) / 2)))
         if ang > 1e-9:
             if abs(ang - math.pi) < 1e-6:
-                axis = norm([math.sqrt(max(0, (R[i][i] + 1) / 2)) for i in range(3)])
+                # Half a turn: the axis is any non-zero column of R + I.
+                j = max(range(3), key=lambda i: R[i][i])
+                axis = norm([R[i][j] + (1.0 if i == j else 0.0) for i in range(3)])
             else:
                 axis = norm([R[2][1] - R[1][2], R[0][2] - R[2][0], R[1][0] - R[0][1]])
             params.update(axis=axis, angle="%.9f deg" % math.degrees(ang))
@@ -512,12 +569,166 @@ class Translator:
         if not profs or not f.get("path_sketch") or None in f["path"]:
             return self.fallback(s, new, after)
         params = {"sketch": sketch, "profiles": profs, "path_sketch": self.sketch_names.get(f["path_sketch"], f["path_sketch"]),
-                  "path": f["path"], "operation": "new" if f["operation"].startswith("new") else f["operation"], "name": s["name"]}
+                  "path": f["path"], "operation": "new" if f["operation"].startswith("new") else f["operation"], "name": self.fname(s)}
         if f["operation"] in ("join", "cut", "intersect") and f.get("participants"):
             params["targets"] = f["participants"]
         rev = dict(params, path=list(reversed(params["path"])))
         self.emit("solid.sweep", params, new=new, alts=[rev, self.alt_points(params, points), self.alt_points(rev, points)],
                   match=self.match_info(f))
+
+    # --- features added for blends, mirrors, revolves, patterns and lofts --------------------
+
+    def fname(self, s):
+        """A SolidCraft feature name for this step, unique even where components reuse names."""
+        name = s["name"]
+        if name in self.features.values():
+            name = "%s (%s)" % (name, s.get("component") or "")
+        if name in self.features.values():
+            name = "%s #%d" % (name, s["index"])
+        self.features[(s.get("component"), s["name"])] = name
+        return name
+
+    def delta(self, after):
+        """How the step changes the total volume and its moment, for checking alternatives."""
+        def tot(b):
+            v, m = 0.0, [0.0, 0.0, 0.0]
+            for x in b.values():
+                if x.get("volume") and x.get("center"):
+                    v += x["volume"]
+                    m = [a + x["volume"] * c for a, c in zip(m, x["center"])]
+            return v, m
+        v0, m0 = tot(getattr(self, "prev", {}))
+        v1, m1 = tot(after)
+        return [v1 - v0] + [a - b for a, b in zip(m1, m0)]
+
+    def targets(self, f, new):
+        if f["operation"] in ("join", "cut", "intersect"):
+            t = f.get("participants") or [b for b in f.get("bodies", []) if b not in new]
+            return {"targets": t} if t else {}
+        return {}
+
+    def f_FilletFeature(self, s, f, new, gone, after):
+        self.blend(s, f, new, after, "solid.fillet")
+
+    def f_ChamferFeature(self, s, f, new, gone, after):
+        self.blend(s, f, new, after, "solid.chamfer")
+
+    def blend(self, s, f, new, after, command):
+        cmds = []
+        for es in f["sets"]:
+            if es.get("other") or not es["edges"]:
+                return self.fallback(s, new, after)
+            k = es["kind"]
+            if k == "ConstantRadiusFilletEdgeSet":
+                size = {"radius": es["radius"]}
+            elif k == "ChordLengthFilletEdgeSet":
+                size = {"radius": es.get("chordLength") or es.get("radius"), "type": "chord"}
+            elif k == "EqualDistanceChamferEdgeSet":
+                size = {"distance": es["distance"]}
+            elif k == "TwoDistancesChamferEdgeSet":
+                size = {"distance": es["distanceOne"], "distance2": es["distanceTwo"]}
+            elif k == "DistanceAndAngleChamferEdgeSet":
+                size = {"distance": es["distance"], "angle": es["angle"]}
+            else:
+                return self.fallback(s, new, after)
+            if not all(size.values()):
+                return self.fallback(s, new, after)
+            groups = {}
+            for p, b in zip(es["edges"], es["edge_bodies"]):
+                groups.setdefault(b, []).append(p)
+            for body, edges in groups.items():
+                cmds.append(dict(size, edges=edges, body=body))
+        one = len(cmds) == 1
+        base = self.fname(s)
+        for i, params in enumerate(cmds):
+            params["name"] = base if one else "%s (%d)" % (base, i + 1)
+            tries = []
+            if "distance2" in params or "angle" in params:
+                tries.append(dict(params, flip=True))
+            self.emit(command, params, new=new, tries=tries if one else None, delta=self.delta(after) if one else None)
+
+    def inputs(self, f):
+        """A pattern's or mirror's inputs as SolidCraft parameters, or None."""
+        ins = f.get("inputs") or []
+        if ins and all(isinstance(x, str) for x in ins):
+            return {"bodies": ins}
+        if ins and all(isinstance(x, dict) and x.get("feature") for x in ins):
+            names = [self.features.get((x.get("component"), x["feature"])) for x in ins]
+            if None not in names:
+                return {"features": names}
+        return None
+
+    def f_MirrorFeature(self, s, f, new, gone, after):
+        ins = self.inputs(f)
+        pl = f.get("plane") or {}
+        if not ins or "origin" not in pl:
+            return self.fallback(s, new, after)
+        params = dict(ins, plane={"origin": pl["origin"], "normal": pl["normal"]}, name=self.fname(s))
+        if "bodies" in ins and f.get("combine"):
+            params["combine"] = True
+        alts = None
+        if "features" in ins and f.get("bodies") and not new:
+            # A symmetric part: the whole body mirrored onto itself is the same shape, and
+            # SolidCraft refuses some feature mirrors whose copy touches the original.
+            alts = [dict(params, features=None, bodies=f["bodies"], combine=True)]
+            del alts[0]["features"]
+        self.emit("solid.mirror", params, new=new, alts=alts)
+
+    def f_CircularPatternFeature(self, s, f, new, gone, after):
+        ins = self.inputs(f)
+        ax = f.get("axis") or {}
+        if not ins or "dir" not in ax or f.get("suppressed"):
+            return self.fallback(s, new, after)
+        count = f["count"]
+        params = dict(ins, axis={"origin": ax["origin"], "dir": ax["dir"]},
+                      count=int(float(count)) if count.replace(".", "").isdigit() else count,
+                      angle=f.get("angle") or "360 deg", name=self.fname(s))
+        if f.get("symmetric"):
+            params["alignment"] = "center"
+        rev = dict(params, axis={"origin": ax["origin"], "dir": [-c for c in ax["dir"]]})
+        self.emit("solid.pattern.circular", params, new=new, tries=[rev], delta=self.delta(after))
+
+    def f_RevolveFeature(self, s, f, new, gone, after):
+        sketch, profs, points = self.profiles(f)
+        ax = f.get("axis") or {}
+        if not profs or f.get("other_profiles") or "dir" not in ax:
+            return self.fallback(s, new, after)
+        params = {"sketch": sketch, "profiles": profs, "axis": {"origin": ax["origin"], "dir": ax["dir"]}, "name": self.fname(s)}
+        if f["extent"] == "AngleExtentDefinition":
+            params["angle"] = f["angle"]
+            if f.get("symmetric"):
+                params["direction"] = "symmetric"
+        elif f["extent"] == "TwoSidesAngleExtentDefinition":
+            params.update(angle=f["angle"], angle2=f["angle2"])
+        else:
+            return self.fallback(s, new, after)
+        params["operation"] = "new" if f["operation"].startswith("new") else f["operation"]
+        params.update(self.targets(f, new))
+        full = abs(abs(f.get("angle_value") or 0) - 360) < 1e-6 or f.get("symmetric")
+        rev = None if full else dict(params, axis={"origin": ax["origin"], "dir": [-c for c in ax["dir"]]})
+        self.emit("solid.revolve", params, new=new, alts=[self.alt_points(params, points)],
+                  match=self.match_info(f), tries=[rev] if rev else None, delta=self.delta(after))
+
+    def f_LoftFeature(self, s, f, new, gone, after):
+        if f.get("rails") or f.get("closed") or not f.get("solid", True):
+            return self.fallback(s, new, after)
+        sections = []
+        holes = {sum(1 for lo in sec.get("loops", []) if not lo["outer"]) for sec in f["sections"]}
+        if len(holes) > 1:
+            # SolidCraft needs the same number of holes in every section, even filled ones.
+            return self.fallback(s, new, after)
+        for sec in f["sections"]:
+            if "sketch" not in sec:
+                return self.fallback(s, new, after)
+            if any(None in lo["curves"] for lo in sec["loops"]) or not any(lo["outer"] for lo in sec["loops"]):
+                return self.fallback(s, new, after)
+            # Fusion lofts the outer loop only; SolidCraft makes an inner loop a hole unless the
+            # region inside it is given too.
+            profs = [{"curves": lo["curves"]} for lo in sorted(sec["loops"], key=lambda lo: not lo["outer"])]
+            sections.append({"sketch": self.sketch_names.get(sec["sketch"], sec["sketch"]), "profiles": profs})
+        params = {"sections": sections, "operation": "new" if f["operation"].startswith("new") else f["operation"], "name": self.fname(s)}
+        params.update(self.targets(f, new))
+        self.emit("solid.loft", params, new=new)
 
     def fallback(self, s, new, after):
         """A step SolidCraft has no command for here: its result comes in as a solid."""
