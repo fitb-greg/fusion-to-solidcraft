@@ -1,0 +1,13 @@
+{
+    "autodeskProduct": "Fusion",
+    "type": "addin",
+    "id": "ExportToSolidCraft",
+    "author": "fitb-greg",
+    "description": {
+        "": "Export the open design to SolidCraft with its timeline: parameters, sketches and features as editable history."
+    },
+    "version": "0.1.0",
+    "runOnStartup": true,
+    "supportedOS": "mac|windows",
+    "editEnabled": true
+}

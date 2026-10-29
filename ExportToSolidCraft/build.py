@@ -1,0 +1,408 @@
+"""Build a SolidCraft design from extract.py's JSON.
+
+    python3 build.py design.json out.solidcraft [--cli PATH]
+
+Runs the translated commands one at a time in a headless SolidCraft session, names the bodies
+as Fusion does, checks every body's volume against Fusion's after each step, and saves the
+design. A report (out.report.txt) lists what was dropped, approximated or doesn't match.
+"""
+
+import json
+import math
+import os
+import shutil
+import subprocess
+import sys
+
+import translate
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_CLI = os.environ.get("SOLIDCRAFT_CLI") or shutil.which("solidcraft-cli") or "solidcraft-cli"
+
+
+class Session:
+    def __init__(self, cli, folder):
+        self.p = subprocess.Popen([cli, "mcp", "--headless", "--allow-path", folder], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        self.n = 0
+        self.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "fusion2solidcraft", "version": "1"}})
+        self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def send(self, m):
+        self.p.stdin.write(json.dumps(m) + "\n")
+        self.p.stdin.flush()
+
+    def rpc(self, method, params):
+        self.n += 1
+        self.send({"jsonrpc": "2.0", "id": self.n, "method": method, "params": params})
+        while True:
+            line = self.p.stdout.readline()
+            if not line:
+                raise RuntimeError("SolidCraft stopped")
+            m = json.loads(line)
+            if m.get("id") == self.n:
+                return m
+
+    def tool(self, name, args):
+        res = self.rpc("tools/call", {"name": name, "arguments": args}).get("result", {})
+        text = "".join(c.get("text", "") for c in res.get("content", []))
+        try:
+            body = json.loads(text)
+        except ValueError:
+            body = text
+        return not res.get("isError"), body
+
+    def execute(self, command, params):
+        return self.tool("execute", {"command": command, "params": params})
+
+    def bodies(self):
+        ok, m = self.tool("measure", {})
+        if not ok or not isinstance(m, dict):
+            return {}
+        return {b["name"]: b for b in m.get("bodies", [])}
+
+    def close(self):
+        self.p.stdin.close()
+        self.p.wait(timeout=30)
+
+
+def dist(a, b):
+    return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+
+
+def rename_pieces(s, pieces, wanted, after, log):
+    """Name every piece of a split as Fusion does, by centre of mass (through temporary names,
+    since the names are swapped among themselves)."""
+    have = s.bodies()
+    pieces = [p for p in pieces if p in have and have[p].get("center_of_mass")]
+    wanted = [k for k in wanted if k in after and after[k].get("center")]
+    pairs = []
+    for k in wanted:
+        if not pieces:
+            break
+        p = min(pieces, key=lambda p: dist(have[p]["center_of_mass"], after[k]["center"]))
+        pieces.remove(p)
+        pairs.append((p, k))
+    tmp = []
+    for i, (p, k) in enumerate(pairs):
+        if p != k:
+            s.execute("body.rename", {"body": p, "name": "__piece%d" % i})
+            tmp.append(("__piece%d" % i, k))
+    for p, k in tmp:
+        ok, r = s.execute("body.rename", {"body": p, "name": k})
+        if not ok:
+            log.append("could not name a split piece %s: %s" % (k, str(r)[:150]))
+
+
+def inside_box(p, box, pad=0.01):
+    return all(box[0][i] - pad <= p[i] <= box[1][i] + pad for i in range(3))
+
+
+def name_new_bodies(s, created, fusion_new, after, log):
+    """Give the bodies a step created Fusion's names, matched by centre of mass. Where Fusion made
+    one body of several touching profiles and SolidCraft one body each, they are joined first."""
+    if not created:
+        return
+    have = s.bodies()
+    wanted = [k for k in fusion_new if k in after]
+    if len(created) > len(wanted) and wanted:
+        groups = {}
+        for c in created:
+            b = have.get(c)
+            if not b or b.get("center_of_mass") is None:
+                continue
+            home = [k for k in wanted if after[k].get("bbox") and inside_box(b["center_of_mass"], after[k]["bbox"])]
+            key = home[0] if len(home) == 1 else min(wanted, key=lambda k: dist(after[k].get("center", [0, 0, 0]), b["center_of_mass"]))
+            groups.setdefault(key, []).append(c)
+        merged = []
+        for key, members in groups.items():
+            if len(members) > 1:
+                ok, r = s.execute("solid.combine", {"target": members[0], "tools": members[1:], "operation": "join"})
+                if not ok:
+                    log.append("could not join %s into one body as Fusion has it: %s" % (members, str(r)[:200]))
+                    merged += members
+                    continue
+            merged.append(members[0])
+        created = merged
+        have = s.bodies()
+    for c in created:
+        b = have.get(c)
+        if not b or b.get("center_of_mass") is None or not wanted:
+            continue
+        best = min(wanted, key=lambda k: dist(after[k].get("center", [0, 0, 0]), b["center_of_mass"]))
+        wanted.remove(best)
+        if best != c:
+            ok, r = s.execute("body.rename", {"body": c, "name": best})
+            if not ok:
+                log.append("could not name %s as %s: %s" % (c, best, r))
+
+
+def matched_profiles(s, params, match, log, step):
+    """The command with its profiles named by SolidCraft's own profile indices, each the one
+    whose area and centre match Fusion's."""
+    ok, r = s.execute("sketch.inspect", {"sketch": params["sketch"]})
+    if not ok or not isinstance(r, dict):
+        return None
+    have = r.get("profiles", [])
+    picks = []
+    for m in match:
+        best, best_score = None, None
+        for p in have:
+            a, c = p.get("area_mm2"), p.get("centroid_sketch")
+            if a is None or c is None:
+                continue
+            da = abs(a - m["area"]) / max(m["area"], 1e-9)
+            dc = dist(c, m["centroid"])
+            if da < 1e-3 and dc < 0.01 + 1e-4 * math.sqrt(m["area"]):
+                score = da + dc
+                if best_score is None or score < best_score:
+                    best, best_score = p["index"], score
+        if best is None:
+            log.append("step %s: a profile (area %.1f mm2) has no match in SolidCraft's sketch" % (step, m["area"]))
+            return None
+        picks.append(best)
+    return dict(params, profiles=picks, exact_regions=True)
+
+
+def mismatched(s, after, skip=(), tol=0.002):
+    """Bodies that differ from Fusion's (wrong volume or place, or missing), and bodies Fusion
+    doesn't have."""
+    have = s.bodies()
+    wrong = []
+    for k, v in after.items():
+        if k.split("/", 1)[0] in skip or v.get("volume") is None:
+            continue
+        b = have.get(k)
+        sv = b.get("volume_mm3") if b else None
+        if (b is None or sv is None or abs(sv - v["volume"]) > tol * max(abs(v["volume"]), 1.0)
+                or (v.get("center") and b.get("center_of_mass") and dist(v["center"], b["center_of_mass"]) > 0.05 + 1e-4 * v["volume"] ** (1 / 3))):
+            wrong.append(k)
+    extra = [k for k in have if k not in after and k.split("/", 1)[0] not in skip]
+    return wrong, extra
+
+
+def rename_strays(s, after, wrong, extra):
+    """A body SolidCraft has under another name (moved between components) is renamed, not
+    replaced: matched by volume and place."""
+    have = s.bodies()
+    for x in list(extra):
+        b = have.get(x, {})
+        if b.get("volume_mm3") is None:
+            continue
+        for k in list(wrong):
+            v = after.get(k, {})
+            if (v.get("volume") and abs(b["volume_mm3"] - v["volume"]) <= 0.002 * v["volume"]
+                    and dist(v.get("center", [0, 0, 0]), b.get("center_of_mass", [1e9] * 3)) < 0.1 + 1e-4 * v["volume"] ** (1 / 3)):
+                ok, _ = s.execute("body.rename", {"body": x, "name": k})
+                if ok:
+                    wrong.remove(k)
+                    extra.remove(x)
+                break
+
+
+def replace_with_fusion(s, exporter, step, wrong, extra, log):
+    """Put Fusion's own result for these bodies in place (no history for them up to here)."""
+    rename_strays(s, step["after"], wrong, extra)
+    if extra:
+        s.execute("solid.remove", {"bodies": extra})
+    if not wrong:
+        return True
+    comps = sorted({k.split("/", 1)[0] for k in wrong})
+    try:
+        files = exporter.export(step["index"], comps)
+    except Exception as e:
+        log.append("step %d: Fusion's result could not be exported: %s" % (step["index"], str(e)[:200]))
+        return False
+    present = [k for k in wrong if k in s.bodies()]
+    if present:
+        # A removed body keeps its name in the timeline: free it for Fusion's result first.
+        old = []
+        for k in present:
+            ok, _ = s.execute("body.rename", {"body": k, "name": "%s (before step %d)" % (k, step["index"])})
+            old.append("%s (before step %d)" % (k, step["index"]) if ok else k)
+        s.execute("solid.remove", {"bodies": old})
+    done = True
+    for f in files:
+        want = {k.split("/", 1)[1]: k for k in wrong if k.split("/", 1)[0] == f["component"]}
+        ok, r = s.execute("file.insert_step", {"path": f["path"], "name": "%s from Fusion" % step["name"], "matrix": f["matrix"], "names": "solid"})
+        if not ok:
+            log.append("step %d: importing Fusion's result failed: %s" % (step["index"], str(r)[:200]))
+            done = False
+            continue
+        drop = []
+        have = s.bodies()
+        after = step["after"]
+        for c in r.get("created_bodies", []):
+            b = have.get(c, {})
+            target = want.pop(c, None) if c in want else None
+            if target is None and b.get("volume_mm3") is not None:
+                # Fusion's STEP names duplicates its own way: find it by volume and place.
+                for name, k in list(want.items()):
+                    v = after.get(k, {})
+                    if (v.get("volume") and abs(b["volume_mm3"] - v["volume"]) <= 0.002 * v["volume"]
+                            and dist(v.get("center", [0, 0, 0]), b.get("center_of_mass", [1e9] * 3)) < 0.1 + 1e-4 * v["volume"] ** (1 / 3)):
+                        target = want.pop(name)
+                        break
+            if target is None:
+                drop.append(c)
+                continue
+            ok, r2 = s.execute("body.rename", {"body": c, "name": target})
+            if not ok:
+                log.append("step %d: could not name Fusion's %s: %s" % (step["index"], target, str(r2)[:150]))
+                done = False
+        if drop:
+            s.execute("solid.remove", {"bodies": drop})
+        if want:
+            log.append("step %d: Fusion's export lacked %s" % (step["index"], list(want.values())))
+            done = False
+    return done
+
+
+def compare(s, after, step, log, tol=0.002, skip=()):
+    have = s.bodies()
+    bad = []
+    for k, v in after.items():
+        if k.split("/", 1)[0] in skip:
+            continue
+        fv = v.get("volume")
+        if fv is None:
+            continue
+        b = have.get(k)
+        if b is None:
+            bad.append("%s missing" % k)
+            continue
+        sv = b.get("volume_mm3")
+        if sv is None or abs(sv - fv) > tol * max(abs(fv), 1.0):
+            bad.append("%s volume %s, Fusion %.1f" % (k, "open" if sv is None else "%.1f" % sv, fv))
+        elif v.get("center") and b.get("center_of_mass") and dist(v["center"], b["center_of_mass"]) > 0.05 + 1e-4 * fv ** (1 / 3):
+            bad.append("%s is %.1f mm from where Fusion has it" % (k, dist(v["center"], b["center_of_mass"])))
+    extra = [k for k in have if k not in after and k.split("/", 1)[0] not in skip and not k.endswith(":%s)" % k.rsplit(":", 1)[-1][:-1])]
+    if extra:
+        bad.append("extra bodies %s" % extra)
+    return bad
+
+
+def build(data, out, cli=DEFAULT_CLI, check_every_step=True, exporter=None, tick=None):
+    t = translate.Translator(data)
+    commands, notes = t.run(), t.notes
+    skip = t.linked_components()
+    folder = os.path.dirname(os.path.abspath(out))
+    for c in commands:  # a linked design is converted on its own first, next to this one
+        p = c["params"].get("path")
+        if c["command"] == "component.insert_design" and isinstance(p, dict):
+            c["params"]["path"] = os.path.join(folder, p["linked"] + ".solidcraft")
+            c["params"]["translate"] = [float(v.split()[0]) for v in c["params"]["translate"]]
+            if not os.path.exists(c["params"]["path"]):
+                notes.append((c["step"], "linked design %s not converted yet: convert it first" % p["linked"]))
+    steps = {st["index"]: st for st in data["steps"]}
+    s = Session(cli, os.path.dirname(os.path.abspath(out)))
+    log, dropped, failed, replaced = [], [], [], []
+    checked = set()
+    end_checked = False
+    occ_ids = {}  # component name -> occurrence id of an inserted design
+    sketch_ids = {}  # sketch name -> SolidCraft feature id
+    final_names = {}  # "component/body" -> the plain name it got at the end
+    last_step = None
+    try:
+        for i, c in enumerate(commands):
+            if tick:
+                tick(i, len(commands))
+            step = c.get("step")
+            if check_every_step and last_step is not None and step != last_step and last_step not in checked and "after" in steps.get(last_step, {}):
+                checked.add(last_step)
+                st = steps[last_step]
+                wrong, extra = mismatched(s, st["after"], skip)
+                if (wrong or extra) and os.environ.get("F2S_DEBUG"):
+                    print("step %d mismatch %s extra %s" % (last_step, wrong, extra), file=sys.stderr, flush=True)
+                if (wrong or extra) and exporter is not None:
+                    if replace_with_fusion(s, exporter, st, wrong, extra, log):
+                        replaced.append("step %d %s: %s" % (last_step, st["name"], ", ".join(wrong) or "extra bodies removed"))
+                        wrong, extra = mismatched(s, st["after"], skip)
+                if wrong or extra:
+                    log.append("after step %d %s: %s" % (last_step, st["name"], "; ".join(compare(s, st["after"], last_step, log, skip=skip))))
+            last_step = step if step is not None else last_step
+            if step is None and last_step is not None and not end_checked and exporter is not None and "after" in data["steps"][-1]:
+                end_checked = True
+                for _ in range(2):  # the end state, once more, before components and copies are set up
+                    wrong, extra = mismatched(s, data["steps"][-1]["after"], skip)
+                    if not (wrong or extra):
+                        break
+                    replace_with_fusion(s, exporter, data["steps"][-1], wrong, extra, log)
+            if c["command"] == "fusion.fallback":
+                if exporter is None:
+                    failed.append("step %s %s: no SolidCraft equivalent yet" % (step, c.get("step_name")))
+                continue  # the check after the step brings in Fusion's result
+            params = c["params"]
+            if "paths" in params:  # placements named by component, from earlier replies
+                params = dict(params, paths=[[occ_ids.get(p[len("@occurrence:"):], p) if isinstance(p, str) and p.startswith("@occurrence:") else p
+                                              for p in path] for path in params["paths"]])
+            if c["command"] == "solid.split_body" and params.get("sketch") in sketch_ids:
+                params = dict(params, sketch=sketch_ids[params["sketch"]])
+            if c.get("match"):
+                params = matched_profiles(s, params, c["match"], log, step) or params
+            ok, r = s.execute(c["command"], params)
+            first = r
+            for alt in c.get("alts") or []:
+                if ok:
+                    break
+                if alt:
+                    if c.get("match"):
+                        alt = dict(alt, profiles=params["profiles"]) if params is not c["params"] else alt
+                    ok, r = s.execute(c["command"], alt)
+                    if ok:
+                        log.append("step %s %s: done another way (%s)" % (step, c["command"], str(first)[:120]))
+            if not ok:
+                msg = "step %s %s %s: %s" % (step, c["command"], json.dumps(c["params"])[:200], str(r)[:300])
+                (dropped if c["optional"] else failed).append(msg)
+                continue
+            if c.get("then_move") and isinstance(r, dict) and r.get("occurrence") is not None:
+                ok2, r2 = s.execute("occurrence.move", {"occurrence": r["occurrence"], "matrix": c["then_move"], "space": "world"})
+                if not ok2:
+                    failed.append("placing a copy of %s: %s" % (c["params"]["component"], str(r2)[:200]))
+            if c["command"] == "body.rename" and step is None:
+                final_names[c["params"]["body"]] = c["params"]["name"]
+            if c["command"] == "component.insert_design" and isinstance(r, dict) and r.get("occurrence") is not None:
+                occ_ids[c["params"].get("name")] = r["occurrence"]
+            if c["command"] == "sketch.create" and isinstance(r, dict) and r.get("sketch") is not None:
+                sketch_ids[c["params"].get("name")] = r["sketch"]
+            if isinstance(r, dict) and c.get("renames"):
+                rename_pieces(s, [c["params"]["body"]] + r.get("created_bodies", []), c["renames"], steps[step].get("after", {}), log)
+            elif isinstance(r, dict) and "new" in c:
+                name_new_bodies(s, r.get("created_bodies", []), c["new"], steps[step].get("after", {}), log)
+        final = data["steps"][-1].get("after", {}) if data["steps"] else {}
+        final = {final_names.get(k, k): v for k, v in final.items()}
+
+        mismatch = compare(s, final, None, log, skip=skip)
+        ok, r = s.tool("save", {"path": os.path.abspath(out)})
+        if not ok:
+            failed.append("save: %s" % r)
+    finally:
+        s.close()
+    report = ["%s -> %s" % (data["document"], out), "",
+              "%d commands, %d failed, %d optional dropped, %d steps brought in as Fusion's result" % (len(commands), len(failed), len(dropped), len(replaced)),
+              "final bodies: %s" % ("all match Fusion" if not mismatch else "; ".join(mismatch)), ""]
+    report += ["FUSION RESULT (no history) " + m for m in replaced]
+    report += ["FAILED: " + m for m in failed]
+    report += ["NOTE step %s: %s" % n for n in notes]
+    report += ["CHECK " + m for m in log]
+    report += ["dropped: " + m for m in dropped]
+    with open(os.path.splitext(out)[0] + ".report.txt", "w") as f:
+        f.write("\n".join(report) + "\n")
+    return report
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    cli = DEFAULT_CLI
+    if "--cli" in args:
+        i = args.index("--cli")
+        cli = args[i + 1]
+        del args[i:i + 2]
+    data = json.load(open(args[0]))
+    exporter = None
+    if "--fusion" in args:  # development: Fusion's results come through FusionMCPBridge
+        args.remove("--fusion")
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "dev"))
+        import bridge
+        exporter = bridge.BridgeExporter(data["document"], os.path.dirname(os.path.abspath(args[1])))
+    print("\n".join(build(data, args[1], cli, exporter=exporter)[:60]))

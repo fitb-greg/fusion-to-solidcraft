@@ -1,0 +1,768 @@
+"""Read a Fusion design's timeline into plain JSON (runs inside Fusion).
+
+Lengths are millimetres, points world coordinates unless named `local`. Expressions are
+Fusion's own text (parameters and units), which SolidCraft's expressions also read.
+
+extract(design, start, stop) -> dict with the steps [start, stop); the timeline marker is
+put back where it was.
+"""
+
+import adsk.core
+import adsk.fusion
+import math
+import traceback
+
+CM = 10.0  # Fusion's internal unit is the centimetre
+
+
+def items(c):
+    """The members of a Fusion collection, vector or single object."""
+    if c is None:
+        return []
+    if hasattr(c, "count") and hasattr(c, "item"):
+        return [c.item(i) for i in range(c.count)]
+    try:
+        return list(c)
+    except TypeError:
+        return [c]
+
+
+def mm(v):
+    return round(v * CM, 6)
+
+
+def pt3(p):
+    return [mm(p.x), mm(p.y), mm(p.z)]
+
+
+def vec(v):
+    return [round(v.x, 9), round(v.y, 9), round(v.z, 9)]
+
+
+def occ_transform(design, comp):
+    """The world transform of a component's (first) occurrence; identity for the root."""
+    if comp == design.rootComponent:
+        return adsk.core.Matrix3D.create()
+    occs = design.rootComponent.allOccurrencesByComponent(comp)
+    if occs.count == 0:
+        return adsk.core.Matrix3D.create()
+    return occs.item(0).transform2
+
+
+def comp_path(design, comp):
+    if comp == design.rootComponent:
+        return None
+    return comp.name
+
+
+def body_key(body):
+    """A body's name, unique across the design: component/body."""
+    native = body.nativeObject or body
+    return "%s/%s" % (native.parentComponent.name, native.name)
+
+
+def world_point(design, comp, p):
+    q = p.copy()
+    q.transformBy(occ_transform(design, comp))
+    return pt3(q)
+
+
+def face_point(design, face):
+    native = face.nativeObject or face
+    comp = native.body.parentComponent
+    return world_point(design, comp, native.pointOnFace)
+
+
+def expr(param):
+    try:
+        return param.expression
+    except Exception:
+        return None
+
+
+# --- sketches ---------------------------------------------------------------------------------
+
+def sketch_frame(design, sk):
+    m = sk.transform.copy()
+    m.transformBy(occ_transform(design, sk.parentComponent))
+    o, x, y, z = m.getAsCoordinateSystem()
+    return {"origin": pt3(o), "x_dir": vec(x), "y_dir": vec(y)}
+
+
+def lp(p):
+    g = p.geometry
+    return [mm(g.x), mm(g.y)]
+
+
+def read_sketch(design, sk):
+    ids = {}  # entityToken -> our id
+
+    def tok(e):
+        return e.entityToken
+
+    points = []
+    for p in sk.sketchPoints:
+        pid = "P%d" % len(points)
+        ids[tok(p)] = pid
+        points.append({"id": pid, "at": lp(p), "fixed": p.isFixed, "ref": p.isReference})
+    curves = []
+    for c in sk.sketchCurves:
+        cid = "C%d" % len(curves)
+        ids[tok(c)] = cid
+        d = {"id": cid, "construction": c.isConstruction, "ref": c.isReference, "fixed": c.isFixed}
+        if isinstance(c, adsk.fusion.SketchLine):
+            d.update(kind="line", a=ids.get(tok(c.startSketchPoint)), b=ids.get(tok(c.endSketchPoint)))
+        elif isinstance(c, adsk.fusion.SketchCircle):
+            d.update(kind="circle", center=ids.get(tok(c.centerSketchPoint)), r=mm(c.radius))
+        elif isinstance(c, adsk.fusion.SketchArc):
+            d.update(kind="arc", center=ids.get(tok(c.centerSketchPoint)), a=ids.get(tok(c.startSketchPoint)),
+                     b=ids.get(tok(c.endSketchPoint)), r=mm(c.radius))
+            ev = c.geometry.evaluator
+            _, t0, t1 = ev.getParameterExtents()
+            _, m = ev.getPointAtParameter(0.5 * (t0 + t1))
+            d["mid"] = [mm(m.x), mm(m.y)]
+        else:
+            d.update(kind=type(c).__name__)
+            try:
+                d["samples"] = [[mm(q.x), mm(q.y)] for q in c.geometry.evaluator.getStrokes(0, 0, 0.001)[1]][:500]
+            except Exception:
+                pass
+        curves.append(d)
+    cons = []
+    for g in sk.geometricConstraints:
+        d = {"kind": type(g).__name__.replace("Constraint", "")}
+        for attr in ("point", "pointOne", "pointTwo", "line", "lineOne", "lineTwo", "curveOne", "curveTwo",
+                     "entityOne", "entityTwo", "entity", "circleOne", "circleTwo", "midPointCurve", "symmetryLine"):
+            try:
+                v = getattr(g, attr)
+            except Exception:
+                continue
+            if v is not None:
+                d[attr] = ids.get(tok(v))
+        cons.append(d)
+    dims = []
+    for dm in sk.sketchDimensions:
+        d = {"kind": type(dm).__name__.replace("Sketch", "").replace("Dimension", ""),
+             "expr": expr(dm.parameter) if dm.parameter else None, "driving": dm.isDriving,
+             "value": None}
+        try:
+            d["value"] = dm.parameter.value if dm.parameter else None
+        except Exception:
+            pass
+        for attr in ("entityOne", "entityTwo", "entity", "line", "lineOne", "lineTwo", "pointOne", "pointTwo"):
+            try:
+                v = getattr(dm, attr)
+            except Exception:
+                continue
+            if v is not None:
+                d[attr] = ids.get(tok(v))
+        try:
+            d["orientation"] = dm.orientation
+        except Exception:
+            pass
+        try:
+            t = dm.textPosition
+            d["text"] = [mm(t.x), mm(t.y)]
+        except Exception:
+            pass
+        dims.append(d)
+    profiles = [profile_ref(pr) for pr in sk.profiles]
+    return {"name": sk.name, "frame": sketch_frame(design, sk), "points": points, "curves": curves,
+            "constraints": cons, "dimensions": dims, "profiles": profiles, "ids": ids}
+
+
+def curve_index(sk, entity):
+    """The curve's position in its sketch's curve list (entity tokens differ from call to call)."""
+    sk = sk.nativeObject or sk  # a sketch in an occurrence comes as a proxy; its curves too
+    entity = entity.nativeObject or entity
+    for i, c in enumerate(sk.sketchCurves):
+        if c == entity:
+            return i
+    return None
+
+
+def sketch_uid(sk):
+    sk = sk.nativeObject or sk
+    return "%s/%s#%d" % (sk.parentComponent.name, sk.name, sk.timelineObject.index)
+
+
+def loop_polygon(lo):
+    pts = []
+    for pc in lo.profileCurves:
+        try:
+            _, ps = pc.geometry.evaluator.getStrokes(0, 0, 0.01)
+            pts += [(q.x, q.y) for q in ps]
+        except Exception:
+            pass
+    return pts
+
+
+def inside(poly, x, y):
+    c = False
+    n = len(poly)
+    for i in range(n):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % n]
+        if (y1 > y) != (y2 > y) and x < x1 + (y - y1) * (x2 - x1) / (y2 - y1):
+            c = not c
+    return c
+
+
+def interior_point(pr):
+    """A point inside the profile (in its outer loop, outside its holes), sketch coordinates in mm."""
+    outer, holes = None, []
+    for lo in pr.profileLoops:
+        poly = loop_polygon(lo)
+        if lo.isOuter:
+            outer = poly
+        else:
+            holes.append(poly)
+    if not outer or len(outer) < 3:
+        return None
+
+    def ok(x, y):
+        return inside(outer, x, y) and not any(len(h) > 2 and inside(h, x, y) for h in holes)
+
+    try:
+        c = pr.areaProperties().centroid
+        if ok(c.x, c.y):
+            return [mm(c.x), mm(c.y)]
+    except Exception:
+        pass
+    xs = [p[0] for p in outer]
+    ys = [p[1] for p in outer]
+    # Scan lines across the profile: the middle of the widest inside run.
+    best = None
+    for k in range(1, 40):
+        y = min(ys) + (max(ys) - min(ys)) * k / 40.0
+        xs_cross = []
+        for poly in [outer] + holes:
+            n = len(poly)
+            for i in range(n):
+                x1, y1 = poly[i]
+                x2, y2 = poly[(i + 1) % n]
+                if (y1 > y) != (y2 > y):
+                    xs_cross.append(x1 + (y - y1) * (x2 - x1) / (y2 - y1))
+        xs_cross.sort()
+        for a, b in zip(xs_cross[::2], xs_cross[1::2]):
+            if best is None or b - a > best[0]:
+                if ok((a + b) / 2, y):
+                    best = (b - a, (a + b) / 2, y)
+    return [mm(best[1]), mm(best[2])] if best else None
+
+
+def curve_under(sk, pc):
+    """The sketch curve a profile edge lies on, found by its middle point: Fusion's own answer
+    (sketchEntity) can name a collinear neighbour."""
+    try:
+        ev = pc.geometry.evaluator
+        _, t0, t1 = ev.getParameterExtents()
+        _, m = ev.getPointAtParameter(0.5 * (t0 + t1))
+    except Exception:
+        return curve_index(sk, pc.sketchEntity)
+    native = sk.nativeObject or sk
+    best, best_d = None, 1e-4  # cm
+    for i, c in enumerate(native.sketchCurves):
+        try:
+            cev = c.geometry.evaluator
+            ok, t = cev.getParameterAtPoint(m)
+            if not ok:
+                continue
+            _, a, b = cev.getParameterExtents()
+            if not (min(a, b) - 1e-9 <= t <= max(a, b) + 1e-9):
+                continue
+            _, q = cev.getPointAtParameter(t)
+            d = q.distanceTo(m)
+            if d < best_d:
+                best, best_d = i, d
+        except Exception:
+            continue
+    return best if best is not None else curve_index(sk, pc.sketchEntity)
+
+
+def profile_info(p):
+    d = {"sketch": sketch_uid(p.parentSketch), "loops": profile_ref(p), "point": interior_point(p)}
+    try:
+        a = p.areaProperties()
+        d["area"] = a.area * 100.0  # cm2 -> mm2
+        d["centroid"] = [mm(a.centroid.x), mm(a.centroid.y)]
+    except Exception:
+        pass
+    return d
+
+
+def profile_ref(pr):
+    """A profile as the curve ids of each of its loops, and a point inside it."""
+    sk = pr.parentSketch
+    out = []
+    for lo in pr.profileLoops:
+        idx = [curve_under(sk, pc) for pc in lo.profileCurves]
+        out.append({"outer": lo.isOuter, "curves": ["C%d" % i if i is not None else None for i in idx]})
+    return out
+
+
+# --- features ---------------------------------------------------------------------------------
+
+def extent(e):
+    t = type(e).__name__
+    d = {"type": t}
+    if hasattr(e, "distance"):
+        try:
+            d["expr"] = e.distance.expression
+            d["value"] = mm(e.distance.value)
+        except Exception:
+            pass
+    if hasattr(e, "isPositiveDirection"):
+        try:
+            d["positive"] = e.isPositiveDirection
+        except Exception:
+            pass
+    return d
+
+
+def profiles_on_faces(f, profs):
+    """The regions of the feature's sketch whose inside point lies on the faces at the start of
+    the extrude (with the feature computed), or None when that can't tell."""
+    skuids = {p.get("sketch") for p in profs if "sketch" in p}
+    if len(skuids) != 1:
+        return None
+    first = next(p for p in items(f.profile) if isinstance(p, adsk.fusion.Profile))
+    sk = first.parentSketch.nativeObject or first.parentSketch
+    tl = f.timelineObject
+    tl.rollTo(False)
+    try:
+        faces = [x.nativeObject or x for x in items(f.startFaces)]
+        if not faces:
+            return None
+        planes = [(x, x.geometry) for x in faces if isinstance(x.geometry, adsk.core.Plane)]
+        used = []
+        for pr in sk.profiles:
+            ip = interior_point(pr)
+            if ip is None:
+                continue
+            q = sk.sketchToModelSpace(adsk.core.Point3D.create(ip[0] / CM, ip[1] / CM, 0))
+            on = False
+            for face, pl in planes:
+                n = pl.normal
+                v = adsk.core.Vector3D.create(q.x - pl.origin.x, q.y - pl.origin.y, q.z - pl.origin.z)
+                dd = v.dotProduct(n)
+                p2 = adsk.core.Point3D.create(q.x - n.x * dd, q.y - n.y * dd, q.z - n.z * dd)
+                ok, prm = face.evaluator.getParameterAtPoint(p2)
+                if ok and face.evaluator.isParameterOnFace(prm):
+                    on = True
+                    break
+            if on:
+                used.append(profile_info(pr))
+        return used or None
+    finally:
+        tl.rollTo(True)
+
+
+def read_extrude(design, f, sketches):
+    d = {"operation": ["join", "cut", "intersect", "new", "new_component"][f.operation]}
+    d["two_sided"] = f.hasTwoExtents
+    d["one"] = extent(f.extentOne)
+    if f.hasTwoExtents:
+        d["two"] = extent(f.extentTwo)
+    try:
+        d["symmetric"] = isinstance(f.extentOne, adsk.fusion.SymmetricExtentDefinition)
+        if d["symmetric"]:
+            d["one"]["expr"] = f.extentOne.distance.expression
+            d["one"]["whole"] = f.extentOne.isFullLength
+    except Exception:
+        pass
+    try:
+        if f.taperAngleOne and abs(f.taperAngleOne.value) > 1e-12:
+            d["taper"] = f.taperAngleOne.expression
+    except Exception:
+        pass
+    st = f.startExtent
+    if isinstance(st, adsk.fusion.OffsetStartDefinition):
+        d["start_offset"] = st.offset.expression
+    elif not isinstance(st, adsk.fusion.ProfilePlaneStartDefinition):
+        d["start"] = type(st).__name__
+    profs = []
+    for p in items(f.profile):
+        if isinstance(p, adsk.fusion.Profile):
+            profs.append(profile_info(p))
+        elif isinstance(p, adsk.fusion.BRepFace):
+            profs.append({"face": face_point(design, p)})
+        else:
+            profs.append({"other": type(p).__name__})
+    d["profiles"] = profs
+    # Fusion's API can report a stale profile list for a feature whose sketch changed later;
+    # the faces it made say which regions it really used.
+    try:
+        used = profiles_on_faces(f, profs) if d["operation"] in ("new", "new_component", "join") else None
+        if used is not None:
+            d["profiles"] = used
+    except Exception as e:
+        d["profiles_on_faces_error"] = str(e)
+    try:
+        d["participants"] = [body_key(b) for b in f.participantBodies]
+    except Exception:
+        d["participants"] = []
+    d["bodies"] = [body_key(b) for b in f.bodies]
+    return d
+
+
+def read_feature(design, f, sketches):
+    t = type(f).__name__
+    if t == "ExtrudeFeature":
+        return read_extrude(design, f, sketches)
+    if t == "CombineFeature":
+        return {"target": body_key(f.targetBody), "tools": [body_key(b) for b in items(f.toolBodies)],
+                "operation": ["join", "cut", "intersect"][f.operation] if f.operation < 3 else str(f.operation),
+                "keep_tools": f.isKeepToolBodies, "new_component": f.isNewComponent,
+                "bodies": [body_key(b) for b in f.bodies]}
+    if t == "ShellFeature":
+        faces = items(f.inputEntities)
+        d = {"faces": [face_point(design, x) for x in faces if isinstance(x, adsk.fusion.BRepFace)],
+             "face_bodies": [body_key(x.body) for x in faces if isinstance(x, adsk.fusion.BRepFace)],
+             "bodies_in": [body_key(x) for x in faces if isinstance(x, adsk.fusion.BRepBody)],
+             "inside": expr(f.insideThickness) if f.insideThickness else None,
+             "outside": expr(f.outsideThickness) if f.outsideThickness else None,
+             "tangent_chain": f.isTangentChain, "bodies": [body_key(b) for b in f.bodies]}
+        if faces and isinstance(faces[0], adsk.fusion.BRepFace):
+            d["body"] = body_key(faces[0].body)
+        return d
+    if t == "OffsetFacesFeature":
+        faces = items(f.inputFaces)
+        d = {"faces": [face_point(design, x) for x in faces], "face_bodies": [body_key(x.body) for x in faces], "distance": expr(f.distance),
+             "bodies": [body_key(b) for b in f.bodies]}
+        if faces:
+            d["body"] = body_key(faces[0].body)
+        return d
+    if t in ("CopyPasteBody", "CutPasteBody"):
+        return {"sources": [body_key(b) for b in items(f.sourceBody) if isinstance(b, adsk.fusion.BRepBody)],
+                "bodies": [body_key(b) for b in f.bodies],
+                "into": f.parentComponent.name}
+    if t == "MoveFeature":
+        m = f.transform
+        return {"bodies_in": [body_key(b) for b in items(f.inputEntities) if isinstance(b, adsk.fusion.BRepBody)],
+                "matrix": [round(v, 9) for v in m.asArray()], "bodies": [body_key(b) for b in f.bodies]}
+    if t == "ScaleFeature":
+        d = {"bodies_in": [body_key(b) for b in items(f.inputEntities) if isinstance(b, adsk.fusion.BRepBody)],
+             "uniform": f.isUniform, "bodies": [body_key(b) for b in f.bodies]}
+        try:
+            d["factor"] = expr(f.scaleFactor)
+        except Exception:
+            pass
+        try:
+            d["factors"] = [expr(f.xScale), expr(f.yScale), expr(f.zScale)]
+        except Exception:
+            pass
+        try:
+            pt = f.point
+            d["origin"] = pt3(pt.geometry) if hasattr(pt, "geometry") else None
+        except Exception:
+            pass
+        return d
+    if t == "RemoveFeature":
+        e = f.itemToRemove
+        return {"bodies_in": [body_key(e)] if isinstance(e, adsk.fusion.BRepBody) else [], "what": type(e).__name__}
+    if t == "SplitBodyFeature":
+        tool = f.splittingTool
+        d = {"bodies_in": [body_key(b) for b in items(f.splitBodies)], "tool": type(tool).__name__,
+             "extend": f.isSplittingToolExtended, "bodies": [body_key(b) for b in f.bodies]}
+        if isinstance(tool, adsk.fusion.SketchLine):
+            d["sketch"] = sketch_uid(tool.parentSketch)
+            d["line"] = "C%d" % curve_index(tool.parentSketch, tool)
+        elif isinstance(tool, adsk.fusion.ConstructionPlane):
+            g = tool.geometry
+            m = occ_transform(design, (tool.nativeObject or tool).parent if hasattr(tool, "parent") else design.rootComponent)
+            o = g.origin.copy(); o.transformBy(m)
+            n = g.normal.copy(); n.transformBy(m)
+            d["plane"] = {"origin": pt3(o), "normal": vec(n)}
+        elif isinstance(tool, adsk.fusion.BRepFace):
+            d["face"] = {"body": body_key(tool.body), "point": face_point(design, tool)}
+            try:
+                native = tool.nativeObject or tool  # a proxy's geometry is already placed
+                g = native.geometry
+                if isinstance(g, adsk.core.Plane):
+                    m = occ_transform(design, native.body.parentComponent)
+                    n = g.normal.copy(); n.transformBy(m)
+                    d["plane"] = {"origin": face_point(design, tool), "normal": vec(n)}
+            except Exception:
+                pass
+        elif isinstance(tool, adsk.fusion.BRepBody):
+            d["tool_body"] = body_key(tool)
+        return d
+    if t == "RectangularPatternFeature":
+        ents = items(f.inputEntities)
+        d = {"pattern": "rectangular", "bodies": [body_key(b) for b in f.bodies],
+             "inputs": [body_key(e) if isinstance(e, adsk.fusion.BRepBody) else {"feature": e.name, "type": type(e).__name__} for e in ents],
+             "count1": expr(f.quantityOne), "distance1": expr(f.distanceOne),
+             "count2": expr(f.quantityTwo), "distance2": expr(f.distanceTwo),
+             "spacing": f.patternDistanceType == adsk.fusion.PatternDistanceType.SpacingPatternDistanceType}
+        for k, ent in (("dir1", f.directionOneEntity), ("dir2", f.directionTwoEntity)):
+            d[k] = direction(design, ent)
+        try:
+            d["symmetric1"] = f.isSymmetricInDirectionOne
+            d["symmetric2"] = f.isSymmetricInDirectionTwo
+        except Exception:
+            pass
+        return d
+    if t == "SweepFeature":
+        prof = items(f.profile)
+        path = f.path
+        d = {"operation": ["join", "cut", "intersect", "new", "new_component"][f.operation],
+             "profiles": [profile_info(p) for p in prof if isinstance(p, adsk.fusion.Profile)],
+             "path": [], "bodies": [body_key(b) for b in f.bodies],
+             "participants": [body_key(b) for b in items(f.participantBodies)] if f.participantBodies else []}
+        for i in range(path.count):
+            e = path.item(i).entity
+            if isinstance(e, adsk.fusion.SketchCurve):
+                d["path_sketch"] = sketch_uid(e.parentSketch)
+                d["path"].append("C%d" % curve_index(e.parentSketch, e))
+            else:
+                d["path"].append(None)
+        try:
+            d["orientation"] = f.orientation
+        except Exception:
+            pass
+        return d
+    return {"bodies": [body_key(b) for b in getattr(f, "bodies", [])] if hasattr(f, "bodies") else []}
+
+
+def direction(design, ent):
+    """A direction picked as an edge, sketch line or construction axis, as a world vector."""
+    if ent is None:
+        return None
+    try:
+        if isinstance(ent, adsk.fusion.BRepEdge):
+            g = ent.geometry
+            comp = (ent.nativeObject or ent).body.parentComponent
+            a, b = g.startPoint.copy(), g.endPoint.copy()
+        elif isinstance(ent, adsk.fusion.SketchLine):
+            g = ent.worldGeometry
+            comp = design.rootComponent
+            a, b = g.startPoint.copy(), g.endPoint.copy()
+            m = occ_transform(design, (ent.nativeObject or ent).parentSketch.parentComponent)
+            a.transformBy(m); b.transformBy(m)
+            return vec(adsk.core.Vector3D.create(b.x - a.x, b.y - a.y, b.z - a.z))
+        elif isinstance(ent, adsk.fusion.ConstructionAxis):
+            v = ent.geometry.direction
+            return vec(v)
+        else:
+            return {"unknown": type(ent).__name__}
+        m = occ_transform(design, comp)
+        a.transformBy(m); b.transformBy(m)
+        return vec(adsk.core.Vector3D.create(b.x - a.x, b.y - a.y, b.z - a.z))
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def bodies_now(design):
+    out = {}
+    for comp in design.allComponents:
+        for b in comp.bRepBodies:
+            try:
+                vol = b.volume * 1000.0  # cm3 -> mm3
+            except Exception:
+                vol = None
+            d = {"volume": round(vol, 3) if vol is not None else None, "visible": b.isLightBulbOn}
+            try:
+                d["center"] = world_point(design, comp, b.physicalProperties.centerOfMass)
+                bb = b.boundingBox
+                d["bbox"] = [world_point(design, comp, bb.minPoint), world_point(design, comp, bb.maxPoint)]
+            except Exception:
+                pass
+            out[body_key(b)] = d
+    return out
+
+
+def extract(design, start=0, stop=None, sketches=None, rollback=True):
+    tl = design.timeline
+    marker = tl.markerPosition
+    stop = tl.count if stop is None else min(stop, tl.count)
+    sketches = {} if sketches is None else sketches
+    steps = []
+    try:
+        for i in range(start, stop):
+            item = tl.item(i)
+            step = {"index": i, "name": item.name, "suppressed": item.isSuppressed}
+            try:
+                # Inputs are read with the model as it was before this step; an occurrence only
+                # exists after it.
+                if rollback:
+                    kind = type(item.entity).__name__
+                    item.rollTo(kind not in ("Occurrence", "Sketch", "ConstructionPlane", "ConstructionAxis", "ConstructionPoint"))
+                e = item.entity
+                t = type(e).__name__
+                step["type"] = t
+                if t == "Sketch":
+                    s = read_sketch(design, e)
+                    s["uid"] = sketch_uid(e)
+                    s["component"] = e.parentComponent.name
+                    sketches[e.entityToken] = {"uid": s["uid"], "ids": s["ids"]}
+                    del s["ids"]
+                    step["sketch"] = s
+                elif t == "Occurrence":
+                    step["component"] = e.component.name
+                    if e.isReferencedComponent:
+                        step["linked"] = e.documentReference.dataFile.name if e.documentReference else e.component.name
+                    step["parent"] = e.assemblyContext.component.name if e.assemblyContext else None
+                    step["matrix"] = [round(v, 9) for v in e.transform2.asArray()]
+                elif t == "ConstructionPlane":
+                    g = e.geometry
+                    step["plane"] = {"origin": pt3(g.origin), "normal": vec(g.normal)}
+                else:
+                    try:
+                        step["component"] = e.parentComponent.name
+                    except Exception:
+                        pass
+                    step["feature"] = read_feature(design, e, sketches)
+                step["health"] = getattr(e, "healthState", None) if e is not None else None
+                if rollback:
+                    item.rollTo(False)
+                    step["after"] = bodies_now(design)
+            except Exception:
+                step["error"] = traceback.format_exc().strip().splitlines()[-1]
+            steps.append(step)
+    finally:
+        if marker >= tl.count:
+            tl.moveToEnd()
+        else:
+            tl.markerPosition = marker
+    return {"steps": steps, "sketches": sketches}
+
+
+def parameters(design):
+    return [{"name": p.name, "expression": p.expression, "unit": p.unit, "comment": p.comment}
+            for p in design.userParameters]
+
+
+def components(design):
+    out = []
+    for occ in design.rootComponent.allOccurrences:
+        d = {"component": occ.component.name, "occurrence": occ.fullPathName,
+             "matrix": [round(v, 9) for v in occ.transform2.asArray()],
+             "bodies": [b.name for b in occ.component.bRepBodies],
+             "parent": occ.assemblyContext.component.name if occ.assemblyContext else None,
+             "visible": occ.isVisible}
+        if occ.isReferencedComponent:
+            d["linked"] = occ.documentReference.dataFile.name if occ.documentReference else occ.component.name
+        else:
+            p = occ.assemblyContext
+            while p is not None:
+                if p.isReferencedComponent:
+                    d["inside_linked"] = True
+                    break
+                p = p.assemblyContext
+        out.append(d)
+    return out
+
+
+def export_step(design, index, components, folder):
+    """The bodies of these components as they are just after timeline step `index`, one STEP
+    file per component: [{component, path, matrix}] with the component's world placement
+    (row-major 4x4, millimetres)."""
+    import os
+    tl = design.timeline
+    marker = tl.markerPosition
+    out = []
+    try:
+        tl.item(index).rollTo(False)
+        for name in components:
+            comp = design.rootComponent if name == design.rootComponent.name else design.allComponents.itemByName(name)
+            if comp is None:
+                continue
+            path = os.path.join(folder, "fusion-step%d-%s.step" % (index, "".join(ch if ch.isalnum() else "_" for ch in name)))
+            em = design.exportManager
+            # STEP export leaves hidden bodies out: show them for the export only.
+            hidden = [b for b in comp.bRepBodies if not b.isLightBulbOn]
+            for b in hidden:
+                b.isLightBulbOn = True
+            try:
+                em.execute(em.createSTEPExportOptions(path, comp))
+            finally:
+                for b in hidden:
+                    b.isLightBulbOn = False
+            m = list(occ_transform(design, comp).asArray())
+            for i in (3, 7, 11):
+                m[i] *= CM
+            out.append({"component": name, "path": path, "matrix": [round(v, 9) for v in m]})
+    finally:
+        if marker >= tl.count:
+            tl.moveToEnd()
+        else:
+            tl.markerPosition = marker
+    return out
+
+
+# --- looks -------------------------------------------------------------------------------------
+
+COLOR_IDS = ("opaque_albedo", "wood_early_color", "generic_diffuse", "metal_f0", "layered_diffuse",
+             "glazing_transmittance_color", "surface_albedo")
+NAMED = {"black": "#191919", "white": "#f2f2f2", "grey": "#808080", "gray": "#808080", "red": "#b3261e",
+         "blue": "#1f4fa3", "green": "#2e7d32", "yellow": "#e0b000", "orange": "#e07000", "brown": "#6b4a2b",
+         "silver": "#c0c0c0", "gold": "#d4af37", "clear": "#e8eef2"}
+
+
+def look(app_):
+    """An appearance as {name, color, opacity, metallic, roughness}: its main colour, read by
+    the property its kind of appearance keeps it in."""
+    found = {}
+    for p in app_.appearanceProperties:
+        if isinstance(p, adsk.core.ColorProperty):
+            try:
+                v = p.value
+            except Exception:
+                v = None
+            if v is not None and p.id not in found:
+                found[p.id] = (v.red, v.green, v.blue)
+    rgb = None
+    for k in COLOR_IDS:
+        if k in found and not (k == "surface_albedo" and found[k] == (255, 255, 255) and len(found) > 1):
+            rgb = found[k]
+            break
+    name = app_.name
+    low = name.lower()
+    if rgb is None or rgb == (255, 255, 255) and "white" not in low:
+        for word, hexv in NAMED.items():
+            if word in low:
+                rgb = tuple(int(hexv[i:i + 2], 16) for i in (1, 3, 5))
+                break
+    if rgb is None:
+        rgb = (176, 176, 176)
+    d = {"name": name, "color": "#%02x%02x%02x" % rgb}
+    if any(w in low for w in ("steel", "aluminum", "aluminium", "metal", "chrome", "brass", "copper", "iron", "titanium", "gold", "silver", "zinc", "nickel")):
+        d["metallic"] = 1.0
+        d["roughness"] = 0.15 if "polish" in low or "chrome" in low or "mirror" in low else 0.6 if "brushed" in low or "cast" in low else 0.35
+    elif any(w in low for w in ("glass", "clear", "acrylic", "transparent", "plexi")) and "matte (black)" not in low:
+        d["opacity"] = 0.35
+    return d
+
+
+def looks(design):
+    """Each body's appearance and physical material, and faces painted differently."""
+    out = {}
+    for comp in design.allComponents:
+        for b in comp.bRepBodies:
+            d = {}
+            try:
+                d["appearance"] = look(b.appearance)
+            except Exception:
+                pass
+            try:
+                m = b.material
+                dens = m.materialProperties.itemByName("Density")
+                d["material"] = {"name": m.name, "density_g_cm3": round(dens.value / 1000.0, 6) if dens else None}
+            except Exception:
+                pass
+            faces = []
+            try:
+                base = b.appearance.name
+                for f in b.faces:
+                    fa = f.appearance
+                    if fa is not None and fa.name != base:
+                        faces.append({"point": world_point(design, comp, f.pointOnFace), "appearance": look(fa)})
+                        if len(faces) >= 200:
+                            break
+            except Exception:
+                pass
+            if faces:
+                d["faces"] = faces
+            out[body_key(b)] = d
+    return out
